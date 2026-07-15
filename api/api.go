@@ -97,6 +97,7 @@ func (s *Server) Start(addr string) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/kv/", s.handleKV)
+	mux.HandleFunc("/healthz", s.handleHealthz)
 
 	// Wrap in recovery middleware for resilience
 	s.httpServer = &http.Server{
@@ -310,3 +311,11 @@ func contextWithTimeout() (context.Context, context.CancelFunc) {
 		return ctx, cancel
 	}(context.Background(), 5*time.Second)
 }
+
+// handleHealthz responds to lightweight HTTP health checks.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status": "healthy"}`))
+}
+

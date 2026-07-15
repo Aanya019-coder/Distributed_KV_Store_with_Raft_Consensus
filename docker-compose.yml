@@ -1,0 +1,166 @@
+version: "3.8"
+
+services:
+  # One-shot service to bootstrap TLS certs with SANs for localhost + container names
+  cert-init:
+    image: alpine:3.19
+    container_name: cert-init
+    volumes:
+      - ./certs:/app/certs
+      - ./scripts:/app/scripts
+    working_dir: /app
+    entrypoint:
+      - sh
+      - -c
+      - |
+        apk add --no-cache openssl
+        sh /app/scripts/gen-certs.sh
+        # Force strict 0600 file permissions on generated private keys for security hygiene
+        chmod 600 /app/certs/node1/node.key /app/certs/node2/node.key /app/certs/node3/node.key
+
+  node1:
+    build: .
+    container_name: node1
+    environment:
+      - KV_API_TOKEN=mysecrettoken
+    command:
+      - -id
+      - node1
+      - -grpc-addr
+      - :9000
+      - -http-addr
+      - :8080
+      - -peers
+      - node2=node2:9000,node3=node3:9000
+      - -peer-http
+      - node2=node2:8080,node3=node3:8080
+      - -storage-dir
+      - /data
+      - -ca-cert
+      - /certs/ca.pem
+      - -node-cert
+      - /certs/node.pem
+      - -node-key
+      - /certs/node.key
+      - -peer-server-name
+      - localhost
+      - -allow-unauth-reads
+      - -snapshot-threshold
+      - "100"
+    ports:
+      - "8001:8080"
+    volumes:
+      - node1-data:/data
+      - ./certs/node1:/certs:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128M
+    restart: unless-stopped
+    networks:
+      - raft-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+
+  node2:
+    build: .
+    container_name: node2
+    environment:
+      - KV_API_TOKEN=mysecrettoken
+    command:
+      - -id
+      - node2
+      - -grpc-addr
+      - :9000
+      - -http-addr
+      - :8080
+      - -peers
+      - node1=node1:9000,node3=node3:9000
+      - -peer-http
+      - node1=node1:8080,node3=node3:8080
+      - -storage-dir
+      - /data
+      - -ca-cert
+      - /certs/ca.pem
+      - -node-cert
+      - /certs/node.pem
+      - -node-key
+      - /certs/node.key
+      - -peer-server-name
+      - localhost
+      - -allow-unauth-reads
+      - -snapshot-threshold
+      - "100"
+    ports:
+      - "8002:8080"
+    volumes:
+      - node2-data:/data
+      - ./certs/node2:/certs:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128M
+    restart: unless-stopped
+    networks:
+      - raft-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+
+  node3:
+    build: .
+    container_name: node3
+    environment:
+      - KV_API_TOKEN=mysecrettoken
+    command:
+      - -id
+      - node3
+      - -grpc-addr
+      - :9000
+      - -http-addr
+      - :8080
+      - -peers
+      - node1=node1:9000,node2=node2:9000
+      - -peer-http
+      - node1=node1:8080,node2=node2:8080
+      - -storage-dir
+      - /data
+      - -ca-cert
+      - /certs/ca.pem
+      - -node-cert
+      - /certs/node.pem
+      - -node-key
+      - /certs/node.key
+      - -peer-server-name
+      - localhost
+      - -allow-unauth-reads
+      - -snapshot-threshold
+      - "100"
+    ports:
+      - "8003:8080"
+    volumes:
+      - node3-data:/data
+      - ./certs/node3:/certs:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 128M
+    restart: unless-stopped
+    networks:
+      - raft-net
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  raft-net:
+    driver: bridge
