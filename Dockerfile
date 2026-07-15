@@ -17,8 +17,8 @@ FROM alpine:3.19
 # Install ca-certificates and curl for health check utility
 RUN apk add --no-cache ca-certificates curl
 
-# Setup non-root execution context for security
-RUN addgroup -S raft && adduser -S raft -G raft
+# Setup non-root execution context for security with static UID/GID 1000
+RUN addgroup -g 1000 raft && adduser -u 1000 -S -G raft raft
 
 # Pre-create resource paths and assign ownership to non-root user
 RUN mkdir -p /data /certs && chown -R raft:raft /data /certs

@@ -15,8 +15,13 @@ services:
       - |
         apk add --no-cache openssl
         sh /app/scripts/gen-certs.sh
-        # Force strict 0600 file permissions on generated private keys for security hygiene
+        # Set ownership of all certs to UID/GID 1000 (raft user) for Linux container compatibility
+        chown -R 1000:1000 /app/certs
+        # Force strict permissions: 600 for private keys, 644 for public certs
         chmod 600 /app/certs/node1/node.key /app/certs/node2/node.key /app/certs/node3/node.key
+        chmod 644 /app/certs/node1/ca.pem /app/certs/node1/node.pem
+        chmod 644 /app/certs/node2/ca.pem /app/certs/node2/node.pem
+        chmod 644 /app/certs/node3/ca.pem /app/certs/node3/node.pem
 
   node1:
     build: .
