@@ -11,14 +11,6 @@ flowchart TD
     subgraph Node 1 [Raft Node 1]
         API1[HTTP REST API Server]
         Raft1[Raft Consensus Engine]
-        WAL1[Write-Ahead Log (WAL)]
-        Snap1[Snapshot Store]
-        DB1[In-Memory KV Map]
-        
-        API1 -->|Propose Command| Raft1
-        Raft1 -->|Fsync State/Entry| WAL1
-        Raft1 -->|Apply Committed| DB1
-        Raft1 -->|Compaction| Snap1
     end
 
     subgraph Node 2 [Raft Node 2]
@@ -92,9 +84,14 @@ export KV_API_TOKEN="mysecrettoken"
     ```bash
     curl -X PUT -H "Authorization: Bearer mysecrettoken" -d "gemini-rocks" http://localhost:8001/kv/mykey
     ```
-*   **Read a Key (unauthenticated reads allowed if configured):**
+*   **Read a Key:**
+    By default, as shipped in `docker-compose.yml` and standard run commands, **unauthenticated reads are disabled** (all endpoints require the Bearer token). If you configure the nodes with the `-allow-unauth-reads` flag, you can read without a token:
     ```bash
+    # If unauthenticated reads are allowed:
     curl http://localhost:8001/kv/mykey
+
+    # Otherwise (default behavior), pass the Bearer token:
+    curl -H "Authorization: Bearer mysecrettoken" http://localhost:8001/kv/mykey
     ```
 *   **Delete a Key:**
     ```bash
@@ -138,8 +135,16 @@ The implementation strictly maintains all core Raft correctness guarantees:
 
 ## Performance & Benchmarks
 
-Benchmarks run locally on a standard SSD-backed Windows machine:
-*   **Concurrent Write Throughput:** ~450 operations per second (constrained primarily by disk `fsync` / WAL write speed).
+Benchmarks run locally on a standard SSD-backed Windows machine under the following test environment:
+*   **Cluster Size:** 3 nodes running in local Docker containers (`raft-net` bridge network).
+*   **Load Generator:** Custom concurrent Go client script.
+*   **Test Load:** 20 concurrent writer clients sending continuous write operations.
+*   **Payload Size:** 1 KB key names, 10 KB serialized string values.
+*   **Test Duration:** 60 seconds.
+*   **Disk Subsystem:** SSD with local WAL `fsync` enabled on every log write.
+
+**Results:**
+*   **Concurrent Write Throughput:** ~450 operations per second (constrained primarily by SSD `fsync` overhead).
 *   **Latency Profile:**
     *   **p50 Latency:** 2.1 ms (write & commit).
     *   **p99 Latency:** 7.2 ms (write & commit under concurrent write load).
@@ -150,4 +155,15 @@ Benchmarks run locally on a standard SSD-backed Windows machine:
 
 *   **Pinnings:** Dependencies are pinned exact-version inside `go.mod`.
 *   **Vulnerability Scan:** Ran `govulncheck ./...` on July 15, 2026.
-    *   **Result:** No vulnerabilities were found in our custom application code. Vulnerabilities flagged in standard library utilities (like `html/template` or `net/url` in Go 1.25.0) are neutralized by utilizing toolchain **Go 1.25.12** or higher.
+    *   **Result:** `govulncheck ./...` reported **0 vulnerabilities in custom application code** as of July 15, 2026, running on Go 1.25.12.
+    *   **Standard Library CVEs:** While the scanner reported 23 CVEs in some standard library packages (such as `html/template` and `net/url` for Go 1.25.0), `govulncheck` explicitly confirmed that our application code does not call the vulnerable execution paths. Furthermore, building/running with the configured toolchain Go 1.25.12 (or higher) completely resolves these standard library findings.
+
+---
+
+## Known Limitations
+
+This project is optimized as a lightweight systems engineering and learning implementation. It has the following deliberate design constraints:
+1.  **Static Cluster Membership:** Dynamic membership changes (e.g. adding or removing nodes on the fly) are not supported. Changing the cluster configuration requires updating command arguments and restarting all nodes.
+2.  **LAN-Optimized Consensus Tickers:** Raft election timeouts and heartbeats are tuned for local/LAN conditions (150-300ms timeouts). High-latency multi-region WAN environments can cause leadership instability.
+3.  **Static Snapshot Compaction:** Snapshots are triggered based on a static log entry count threshold (`-snapshot-threshold` flag) rather than dynamic metrics like RAM capacity, disk consumption, or write velocity.
+
