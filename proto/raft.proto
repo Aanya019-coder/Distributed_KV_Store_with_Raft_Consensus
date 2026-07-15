@@ -56,3 +56,16 @@ message InstallSnapshotRequest {
 message InstallSnapshotResponse {
   int64 term = 1;
 }
+
+message StateMetadata {
+  int64 term = 1;
+  string voted_for = 2;
+}
+
+message WALRecord {
+  oneof record {
+    StateMetadata state = 1;
+    LogEntry entry = 2;
+    int64 truncate_index = 3;
+  }
+}
