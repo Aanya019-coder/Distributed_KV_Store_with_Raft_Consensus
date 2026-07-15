@@ -1,0 +1,6 @@
+*.pem
+*.key
+certs/
+data/
+bin/
+*.exe
