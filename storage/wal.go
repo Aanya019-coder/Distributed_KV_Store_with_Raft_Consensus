@@ -161,13 +161,20 @@ func (w *WAL) Reset() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if err := w.file.Truncate(0); err != nil {
+	if w.file != nil {
+		w.file.Close()
+	}
+
+	if err := os.Truncate(w.path, 0); err != nil {
 		return fmt.Errorf("failed to truncate WAL file: %w", err)
 	}
-	if _, err := w.file.Seek(0, 0); err != nil {
-		return fmt.Errorf("failed to seek WAL file to start: %w", err)
+
+	file, err := os.OpenFile(w.path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("failed to reopen WAL file after truncate: %w", err)
 	}
-	return w.file.Sync()
+	w.file = file
+	return nil
 }
 
 // Close closes the WAL file descriptor.

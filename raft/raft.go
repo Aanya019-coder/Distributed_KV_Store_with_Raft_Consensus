@@ -199,6 +199,10 @@ func (r *Raft) Start() error {
 // Stop shuts down the Raft node.
 func (r *Raft) Stop() {
 	r.mu.Lock()
+	if r.state == Shutdown {
+		r.mu.Unlock()
+		return
+	}
 	r.state = Shutdown
 	close(r.shutdown)
 	r.mu.Unlock()
