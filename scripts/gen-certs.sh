@@ -27,6 +27,12 @@ DNS.4 = node3
 IP.1 = 127.0.0.1
 EOF
 
+# Append extra SANs from environment variable if set (comma-separated, e.g. "DNS.5=node1.fly.dev,DNS.6=node2.fly.dev")
+if [ -n "$EXTRA_SANS" ]; then
+    echo "$EXTRA_SANS" | tr ',' '\n' >> certs/node.ext
+fi
+
+
 # Sign Certificate
 openssl x509 -req -in certs/node.csr -CA certs/ca.pem -CAkey certs/ca.key -CAcreateserial -out certs/node.pem -days 365 -sha256 -extfile certs/node.ext
 

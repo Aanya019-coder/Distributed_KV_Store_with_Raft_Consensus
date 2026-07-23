@@ -28,6 +28,7 @@ func main() {
 	nodeKeyPath := flag.String("node-key", "certs/node.key", "Path to Node private key file")
 	peerServerName := flag.String("peer-server-name", "localhost", "Expected Server Name in peer certificates")
 	apiToken := flag.String("api-token", "", "Bearer token required for API writes (falls back to KV_API_TOKEN env var)")
+	adminToken := flag.String("admin-token", "", "Bearer token for admin operations (falls back to api-token / KV_API_TOKEN)")
 	allowUnauthReads := flag.Bool("allow-unauth-reads", false, "Allow unauthenticated GET reads")
 	snapshotThreshold := flag.Int("snapshot-threshold", 1000, "Compacted log threshold for snapshotting")
 	debug := flag.Bool("debug", false, "Enable debug verbose logging")
@@ -41,6 +42,12 @@ func main() {
 	token := *apiToken
 	if token == "" {
 		token = os.Getenv("KV_API_TOKEN")
+	}
+
+	// Resolve Admin Token
+	aToken := *adminToken
+	if aToken == "" {
+		aToken = os.Getenv("KV_ADMIN_TOKEN")
 	}
 
 	// Parse peers
@@ -83,6 +90,9 @@ func main() {
 		log.Fatalf("[ERROR] Failed to initialize Raft: %v", err)
 	}
 
+	// Initialize cluster configuration from startup peers
+	r.InitClusterConfig(peers, peerHTTPAddrs)
+
 	// Start gRPC Server for peer communication using mTLS
 	creds, err := transport.LoadServerCredentials(*caCertPath, *nodeCertPath, *nodeKeyPath)
 	if err != nil {
@@ -110,7 +120,7 @@ func main() {
 	}
 
 	// Start HTTP REST API
-	apiServer := api.NewServer(r, token, *allowUnauthReads, peerHTTPAddrs)
+	apiServer := api.NewServer(r, token, aToken, *allowUnauthReads)
 	if err := apiServer.Start(*httpAddr); err != nil {
 		log.Fatalf("[ERROR] Failed to start HTTP API: %v", err)
 	}

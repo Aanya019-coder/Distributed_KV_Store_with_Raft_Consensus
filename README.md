@@ -163,7 +163,54 @@ Benchmarks run locally on a standard SSD-backed Windows machine under the follow
 ## Known Limitations
 
 This project is optimized as a lightweight systems engineering and learning implementation. It has the following deliberate design constraints:
-1.  **Static Cluster Membership:** Dynamic membership changes (e.g. adding or removing nodes on the fly) are not supported. Changing the cluster configuration requires updating command arguments and restarting all nodes.
-2.  **LAN-Optimized Consensus Tickers:** Raft election timeouts and heartbeats are tuned for local/LAN conditions (150-300ms timeouts). High-latency multi-region WAN environments can cause leadership instability.
-3.  **Static Snapshot Compaction:** Snapshots are triggered based on a static log entry count threshold (`-snapshot-threshold` flag) rather than dynamic metrics like RAM capacity, disk consumption, or write velocity.
+1.  **LAN-Optimized Consensus Tickers:** Raft election timeouts and heartbeats are tuned for local/LAN conditions (150-300ms timeouts). High-latency multi-region WAN environments can cause leadership instability.
+2.  **Static Snapshot Compaction:** Snapshots are triggered based on a static log entry count threshold (`-snapshot-threshold` flag) rather than dynamic metrics like RAM capacity, disk consumption, or write velocity.
+
+---
+
+## Part 1: Dynamic Cluster Membership (Joint Consensus)
+
+Instead of naively switching configurations directly from $C_{old}$ to $C_{new}$ (which can result in overlapping majorities electing two different leaders simultaneously), this implementation uses **Joint Consensus** per §6 of the Raft paper:
+
+1. **Joint Configuration ($C_{old,new}$):** The leader first proposes and commits a log entry containing the configuration union. During this phase, log decisions (e.g. elections, commits) require independent majority approval from **both** $C_{old}$ and $C_{new}$ server groups.
+2. **Final Configuration ($C_{new}$):** Once $C_{old,new}$ is committed, the leader automatically proposes and commits a second configuration entry for $C_{new}$. Once committed, servers not in $C_{new}$ are safely shut down.
+3. **Safety Properties Handled:**
+   * **Disrupted Server Prevention:** Joining nodes start in a restricted "join mode" where they do not trigger elections or disrupt the cluster until they are explicitly added by the leader.
+   * **Leader Step-down:** If the current leader is removed in $C_{new}$, it automatically steps down and transitions to follower once $C_{new}$ is committed.
+   * **New Server Catch-up:** New nodes are replicated to (including snapshots if needed) before they are considered voters, protecting cluster availability.
+
+---
+
+## Part 2: Prometheus & Grafana Observability
+
+Real-time visibility into replication, consensus term progression, leader roles, and RPC/Disk storage latency is provided via a zero-dependency Prometheus metrics scraper and Grafana.
+
+### Metrics Exposed (per node on `/metrics`):
+* `raft_current_term`: Current term gauge.
+* `raft_role`: Role gauge (0=follower, 1=candidate, 2=leader).
+* `raft_commit_index`: Commits index gauge.
+* `raft_leader_elections_total`: Election count counter.
+* `raft_log_entries_total`: Appended log entries counter.
+* `raft_replication_lag_ms`: Replication catch-up latency histogram.
+* `kv_request_duration_ms`: REST API handler latency histogram.
+* `kv_requests_total`: REST API request counter labeled by method and status.
+* `wal_fsync_duration_ms`: WAL disk sync latency histogram.
+
+### Running the Monitoring Stack
+1. Start the cluster along with Prometheus and Grafana:
+   ```bash
+   docker compose up --build
+   ```
+2. Open **Grafana** at `http://localhost:3000` (pre-provisioned with the "Raft KV Store Cluster Overview" dashboard).
+3. Access **Prometheus** targets at `http://localhost:9090`.
+
+---
+
+## Part 3: Live Deployment
+
+The system is fully packageable and ready for public hosting (e.g., Fly.io or Oracle Cloud) with the following features:
+* **SSL Termination:** Expose the client API behind a reverse proxy (Caddy or Nginx) using automatic TLS (Let's Encrypt). A template [Caddyfile](file:///c:/Users/HP/Downloads/raft%20kv%20store/deploy/Caddyfile) is provided in `deploy/`.
+* **Private Networking:** gRPC communication between nodes is secure and isolated via private network DNS/internal hostnames (configured in [fly.toml](file:///c:/Users/HP/Downloads/raft%20kv%20store/deploy/fly.toml)).
+* **Parameterized TLS Certs:** The `gen-certs.sh` script is updated with `EXTRA_SANS` support to easily generate mTLS certificates for real public domain names and internal hostnames.
+
 

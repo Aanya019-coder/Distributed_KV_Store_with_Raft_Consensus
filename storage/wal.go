@@ -8,10 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 	raftproto "raft-kv/proto"
 )
+
+// FsyncObserver is a callback to record fsync performance without circular dependencies.
+var FsyncObserver func(durationMs float64)
 
 // WAL manages the write-ahead log file.
 type WAL struct {
@@ -208,5 +212,10 @@ func (w *WAL) writeRecord(rec *raftproto.WALRecord) error {
 		return fmt.Errorf("failed to write to WAL: %w", err)
 	}
 
-	return w.file.Sync()
+	start := time.Now()
+	err = w.file.Sync()
+	if FsyncObserver != nil {
+		FsyncObserver(float64(time.Since(start).Microseconds()) / 1000.0)
+	}
+	return err
 }

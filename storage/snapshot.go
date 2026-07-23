@@ -7,11 +7,22 @@ import (
 	"path/filepath"
 )
 
+// ClusterConfigSnapshot is the serializable form of cluster configuration
+// persisted in snapshots so config survives log compaction.
+type ClusterConfigSnapshot struct {
+	OldPeers map[string]string `json:"old_peers,omitempty"`
+	NewPeers map[string]string `json:"new_peers"`
+	OldHTTP  map[string]string `json:"old_http,omitempty"`
+	NewHTTP  map[string]string `json:"new_http"`
+	Joint    bool              `json:"joint"`
+}
+
 // Snapshot represents a point-in-time state of the key-value store and the consensus metadata.
 type Snapshot struct {
-	LastIncludedIndex int64             `json:"last_included_index"`
-	LastIncludedTerm  int64             `json:"last_included_term"`
-	KVState           map[string]string `json:"kv_state"`
+	LastIncludedIndex int64                  `json:"last_included_index"`
+	LastIncludedTerm  int64                  `json:"last_included_term"`
+	KVState           map[string]string      `json:"kv_state"`
+	ClusterConfig     *ClusterConfigSnapshot `json:"cluster_config,omitempty"`
 }
 
 // SaveSnapshot writes the snapshot data atomically to disk with 0600 permissions.

@@ -1,0 +1,43 @@
+# Template fly.toml for Raft KV Store Nodes
+# Deploy separate apps or machines for node1, node2, node3.
+# Replace node1 with the target node ID (e.g. node1, node2, node3).
+
+app = "raft-kv-node1"
+primary_region = "hkg"
+
+[build]
+  dockerfile = "../Dockerfile"
+
+[env]
+  KV_API_TOKEN = "mysecrettoken"
+  # Set peer address map (using Fly.io .internal addresses for private network gRPC/HTTP)
+  # PEERS="node2=raft-kv-node2.internal:9000,node3=raft-kv-node3.internal:9000"
+  # PEER_HTTP="node2=raft-kv-node2.internal:8080,node3=raft-kv-node3.internal:8080"
+
+[[mounts]]
+  source = "raft_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[services]]
+  internal_port = 9000
+  protocol = "tcp"
+  [[services.ports]]
+    port = 9000
+  # No public handler for 9000 - only accessible internally via private network
+
+[checks]
+  [checks.health]
+    port = 8080
+    type = "http"
+    path = "/healthz"
+    interval = "10s"
+    timeout = "2s"
+    grace_period = "5s"

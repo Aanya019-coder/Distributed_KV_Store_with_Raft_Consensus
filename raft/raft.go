@@ -2,10 +2,11 @@ package raft
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/big"
 	"sync"
 	"time"
 
@@ -89,13 +90,19 @@ type proposal struct {
 	respCh chan cmdResp
 }
 
+// configChangeReq is sent through the cmdCh for admin config-change proposals.
+type configChangeReq struct {
+	req  ConfigChangeRequest
+	resp chan cmdResp
+}
+
 // Raft implements the Raft consensus state machine.
 type Raft struct {
 	raftproto.UnimplementedRaftServiceServer
 
 	mu        sync.Mutex
 	id        string
-	peers     map[string]string
+	peers     map[string]string // kept in sync with currentConfig for backward compat
 	grpcPeers map[string]*peerClient
 
 	state             RaftState
@@ -113,9 +120,10 @@ type Raft struct {
 	nextIndex  map[string]int64
 	matchIndex map[string]int64
 
-	rpcCh    chan rpcReq
-	cmdCh    chan cmdReq
-	shutdown chan struct{}
+	rpcCh      chan rpcReq
+	cmdCh      chan cmdReq
+	configCh   chan configChangeReq
+	shutdown   chan struct{}
 
 	electionTimeout time.Duration
 	electionTimer   *time.Timer
@@ -126,6 +134,14 @@ type Raft struct {
 	snapshotPath string
 	kv           map[string]string
 	snapshotBuf  []byte
+
+	// Cluster configuration (joint consensus)
+	currentConfig     *ClusterConfig
+	pendingConfig     bool  // true if a config change is in-flight
+	configChangeIndex int64 // log index of the pending C_old,new entry
+	peerHTTPAddrs     map[string]string // HTTP addresses for peers (kept in sync with config)
+	proposalTime      map[int64]time.Time // log index -> propose time for replication lag tracking
+	isJoining         bool              // true if this node is in process of joining cluster
 
 	// Security
 	caCertPath     string
@@ -165,18 +181,22 @@ func NewRaft(
 		matchIndex:        make(map[string]int64),
 		rpcCh:             make(chan rpcReq, 100),
 		cmdCh:             make(chan cmdReq, 100),
+		configCh:          make(chan configChangeReq, 10),
 		shutdown:          make(chan struct{}),
-		electionTimeout:   150 * time.Millisecond,
+		electionTimeout:   500 * time.Millisecond,
 		storageDir:        storageDir,
 		wal:               wal,
 		snapshotPath:      fmt.Sprintf("%s/snapshot.json", storageDir),
 		kv:                make(map[string]string),
+		peerHTTPAddrs:     make(map[string]string),
+		currentConfig:     ConfigFromPeers(peers, nil, id),
 		caCertPath:        caCertPath,
 		nodeCertPath:      nodeCertPath,
 		nodeKeyPath:       nodeKeyPath,
 		peerServerName:    peerServerName,
 		debug:             debug,
 		snapshotThreshold: snapshotThreshold,
+		proposalTime:      make(map[int64]time.Time),
 	}
 
 	if err := r.loadState(); err != nil {
@@ -185,6 +205,30 @@ func NewRaft(
 	}
 
 	return r, nil
+}
+
+// SetPeerHTTPAddrs sets the HTTP addresses for peers (used by API for redirects).
+func (r *Raft) SetPeerHTTPAddrs(addrs map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.peerHTTPAddrs = addrs
+}
+
+// GetPeerHTTPAddrs returns a copy of peer HTTP addresses.
+func (r *Raft) GetPeerHTTPAddrs() map[string]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return copyMap(r.peerHTTPAddrs)
+}
+
+// InitClusterConfig initializes the cluster configuration from startup peers.
+func (r *Raft) InitClusterConfig(grpcPeers, httpPeers map[string]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.currentConfig == nil {
+		r.currentConfig = ConfigFromPeers(grpcPeers, httpPeers, r.id)
+		r.peerHTTPAddrs = copyMap(httpPeers)
+	}
 }
 
 // Start runs the consensus loop and establishes peer connections.
@@ -221,9 +265,28 @@ func (r *Raft) Propose(op, key, val string) (bool, error) {
 		return false, err
 	}
 
+	// Wrap in envelope for Phase 2 compatibility
+	envelopeData, err := EncodeCommandEntry(data)
+	if err != nil {
+		return false, err
+	}
+
 	respCh := make(chan cmdResp, 1)
 	select {
-	case r.cmdCh <- cmdReq{cmd: data, resp: respCh}:
+	case r.cmdCh <- cmdReq{cmd: envelopeData, resp: respCh}:
+	case <-r.shutdown:
+		return false, errors.New("node shutdown")
+	}
+
+	res := <-respCh
+	return res.success, res.err
+}
+
+// ProposeConfigChange proposes a cluster membership change.
+func (r *Raft) ProposeConfigChange(req ConfigChangeRequest) (bool, error) {
+	respCh := make(chan cmdResp, 1)
+	select {
+	case r.configCh <- configChangeReq{req: req, resp: respCh}:
 	case <-r.shutdown:
 		return false, errors.New("node shutdown")
 	}
@@ -254,6 +317,54 @@ func (r *Raft) IsLeader() (bool, string) {
 	return false, r.votedFor
 }
 
+// GetStatus returns the current node status for the /status endpoint.
+func (r *Raft) GetStatus() map[string]interface{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	role := "follower"
+	switch r.state {
+	case Leader:
+		role = "leader"
+	case Candidate:
+		role = "candidate"
+	}
+
+	status := map[string]interface{}{
+		"node_id":      r.id,
+		"role":         role,
+		"current_term": r.currentTerm,
+		"commit_index": r.commitIndex,
+		"last_applied": r.lastApplied,
+		"log_length":   r.lastLogIndex(),
+		"voted_for":    r.votedFor,
+	}
+
+	if r.currentConfig != nil {
+		members := make([]string, 0)
+		members = append(members, r.id)
+		for id := range r.currentConfig.NewPeers {
+			members = append(members, id)
+		}
+		status["cluster_members"] = members
+		status["cluster_size"] = len(members)
+		status["joint_consensus"] = r.currentConfig.Joint
+		status["pending_config_change"] = r.pendingConfig
+	} else {
+		members := make([]string, 0)
+		members = append(members, r.id)
+		for id := range r.peers {
+			members = append(members, id)
+		}
+		status["cluster_members"] = members
+		status["cluster_size"] = len(members)
+		status["joint_consensus"] = false
+		status["pending_config_change"] = false
+	}
+
+	return status
+}
+
 // Simulated network partition
 func (r *Raft) SetPartition(partition map[string]bool) {
 	r.mu.Lock()
@@ -268,11 +379,23 @@ func (r *Raft) SetNetworkDelay(d time.Duration) {
 	r.networkDelay = d
 }
 
+// SetJoining sets the joining status of the node.
+func (r *Raft) SetJoining(joining bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.isJoining = joining
+}
+
 // --- Internal Consensus Logic ---
 
 func (r *Raft) run() {
 	r.mu.Lock()
-	r.resetElectionTimer()
+	if r.electionTimer != nil {
+		r.electionTimer.Stop()
+	}
+	n, _ := rand.Int(rand.Reader, big.NewInt(150))
+	d := r.electionTimeout + 300*time.Millisecond + time.Duration(n.Int64())*time.Millisecond
+	r.electionTimer = time.NewTimer(d)
 	r.mu.Unlock()
 
 	for {
@@ -282,8 +405,10 @@ func (r *Raft) run() {
 
 		case <-r.electionTimer.C:
 			r.mu.Lock()
-			if r.state == Follower || r.state == Candidate {
+			if (r.state == Follower || r.state == Candidate) && !r.isJoining {
 				r.transitionToCandidate()
+			} else if r.isJoining {
+				r.resetElectionTimer()
 			}
 			r.mu.Unlock()
 
@@ -296,15 +421,26 @@ func (r *Raft) run() {
 			r.mu.Lock()
 			r.handleClientCommand(cmdMsg)
 			r.mu.Unlock()
+
+		case cfgMsg := <-r.configCh:
+			r.mu.Lock()
+			r.handleConfigChange(cfgMsg)
+			r.mu.Unlock()
 		}
 	}
 }
 
 func (r *Raft) resetElectionTimer() {
 	if r.electionTimer != nil {
-		r.electionTimer.Stop()
+		if !r.electionTimer.Stop() {
+			select {
+			case <-r.electionTimer.C:
+			default:
+			}
+		}
 	}
-	d := r.electionTimeout + time.Duration(rand.Intn(150))*time.Millisecond
+	n, _ := rand.Int(rand.Reader, big.NewInt(150))
+	d := r.electionTimeout + time.Duration(n.Int64())*time.Millisecond
 	r.electionTimer = time.NewTimer(d)
 }
 
@@ -314,6 +450,10 @@ func (r *Raft) transitionToFollower(term int64) {
 	r.votedFor = ""
 	r.resetElectionTimer()
 	r.logInfo("Transitioned to Follower for term %d", term)
+
+	// Metrics
+	RaftRole.Set(0)
+	RaftCurrentTerm.Set(float64(term))
 
 	// Cancel current proposals
 	for _, p := range r.proposals {
@@ -332,6 +472,11 @@ func (r *Raft) transitionToCandidate() {
 
 	r.logInfo("Transitioned to Candidate for term %d, starting election", r.currentTerm)
 
+	// Metrics
+	RaftRole.Set(1)
+	RaftCurrentTerm.Set(float64(r.currentTerm))
+	RaftLeaderElectionsTotal.Inc()
+
 	if err := r.wal.AppendState(r.currentTerm, r.votedFor); err != nil {
 		r.logError("Failed to persist state on candidate transition: %v", err)
 	}
@@ -346,14 +491,41 @@ func (r *Raft) transitionToLeader() {
 	r.state = Leader
 	r.logInfo("Transitioned to Leader for term %d", r.currentTerm)
 
+	// Metrics
+	RaftRole.Set(2)
+
 	if r.electionTimer != nil {
 		r.electionTimer.Stop()
 	}
 
+	// Ensure connections to all peers exist before broadcasting heartbeats
+	r.connectToPeersLocked()
+
 	lastIdx := r.lastLogIndex()
-	for peerID := range r.peers {
+
+	// Initialize nextIndex/matchIndex for all known peers (from config or legacy peers)
+	allPeers := r.effectivePeers()
+	for peerID := range allPeers {
 		r.nextIndex[peerID] = lastIdx + 1
 		r.matchIndex[peerID] = 0
+	}
+
+	// Append a no-op entry to commit entries from prior terms (§5.4.2 of Raft paper).
+	// This ensures the leader can advance commitIndex for entries from previous terms
+	// by committing at least one entry from its own term.
+	noopData, err := EncodeNoopEntry()
+	if err != nil {
+		r.logError("Failed to encode noop entry: %v", err)
+	} else {
+		noopEntry := &raftproto.LogEntry{
+			Index:   r.lastLogIndex() + 1,
+			Term:    r.currentTerm,
+			Command: noopData,
+		}
+		r.log = append(r.log, noopEntry)
+		if err := r.wal.AppendEntry(noopEntry); err != nil {
+			r.logError("Failed to persist noop entry: %v", err)
+		}
 	}
 
 	r.broadcastHeartbeats()
@@ -379,35 +551,51 @@ func (r *Raft) transitionToLeader() {
 	}()
 }
 
+// effectivePeers returns the current set of peer IDs and gRPC addresses,
+// taking into account the cluster configuration if available.
+func (r *Raft) effectivePeers() map[string]string {
+	if r.currentConfig != nil {
+		return r.currentConfig.AllNodeGRPC(r.id)
+	}
+	return r.peers
+}
+
 func (r *Raft) startElection() {
 	term := r.currentTerm
 	lastLogIdx := r.lastLogIndex()
 	lastLogTerm := r.lastLogTerm()
 
-	if len(r.peers) == 0 {
+	allPeers := r.effectivePeers()
+
+	if len(allPeers) == 0 {
 		r.transitionToLeader()
 		return
 	}
 
-	for peerID, peerAddr := range r.peers {
+	for peerID, peerAddr := range allPeers {
 		go func(pid, addr string) {
 			resp, err := r.sendRequestVote(pid, term, lastLogIdx, lastLogTerm)
 			if err != nil {
 				r.logDebug("Failed to send RequestVote to %s: %v", pid, err)
 				return
 			}
-			r.rpcCh <- rpcReq{
-				req: &voteRespMsg{
-					peerID: pid,
-					resp:   resp,
-				},
+			msg := &voteRespMsg{peerID: pid, resp: resp}
+			select {
+			case r.rpcCh <- rpcReq{req: msg}:
+			case <-r.shutdown:
+				return
+			default:
+				r.mu.Lock()
+				r.processRequestVoteResponse(msg)
+				r.mu.Unlock()
 			}
 		}(peerID, peerAddr)
 	}
 }
 
 func (r *Raft) broadcastHeartbeats() {
-	for peerID := range r.peers {
+	allPeers := r.effectivePeers()
+	for peerID := range allPeers {
 		go r.replicateToPeer(peerID)
 	}
 }
@@ -447,11 +635,15 @@ func (r *Raft) replicateToPeer(peerID string) {
 		return
 	}
 
-	r.rpcCh <- rpcReq{
-		req: &appendRespMsg{
-			peerID: peerID,
-			resp:   resp,
-		},
+	msg := &appendRespMsg{peerID: peerID, resp: resp}
+	select {
+	case r.rpcCh <- rpcReq{req: msg}:
+	case <-r.shutdown:
+		return
+	default:
+		r.mu.Lock()
+		r.processAppendEntriesResponse(msg)
+		r.mu.Unlock()
 	}
 }
 
@@ -501,21 +693,29 @@ func (r *Raft) sendSnapshotToPeer(peerID string) {
 		}
 
 		if resp.Term > term {
-			r.rpcCh <- rpcReq{
-				req: &snapshotRespMsg{
-					peerID: peerID,
-					resp:   resp,
-				},
+			msg := &snapshotRespMsg{peerID: peerID, resp: resp}
+			select {
+			case r.rpcCh <- rpcReq{req: msg}:
+			case <-r.shutdown:
+				return
+			default:
+				r.mu.Lock()
+				r.processInstallSnapshotResponse(msg)
+				r.mu.Unlock()
 			}
 			return
 		}
 
 		if done {
-			r.rpcCh <- rpcReq{
-				req: &snapshotRespMsg{
-					peerID: peerID,
-					resp:   resp,
-				},
+			msg := &snapshotRespMsg{peerID: peerID, resp: resp}
+			select {
+			case r.rpcCh <- rpcReq{req: msg}:
+			case <-r.shutdown:
+				return
+			default:
+				r.mu.Lock()
+				r.processInstallSnapshotResponse(msg)
+				r.mu.Unlock()
 			}
 			break
 		}
@@ -554,6 +754,12 @@ func (r *Raft) processRequestVote(req *raftproto.RequestVoteRequest) *raftproto.
 		return &raftproto.RequestVoteResponse{Term: r.currentTerm, VoteGranted: false}
 	}
 
+	// Reject votes from candidates not in the active cluster configuration (§6 Raft paper)
+	if r.currentConfig != nil && !r.currentConfig.ContainsNode(req.CandidateId) {
+		r.logInfo("Ignoring RequestVote from %s: candidate not in cluster configuration", req.CandidateId)
+		return &raftproto.RequestVoteResponse{Term: r.currentTerm, VoteGranted: false}
+	}
+
 	if req.Term > r.currentTerm {
 		r.transitionToFollower(req.Term)
 	}
@@ -582,9 +788,18 @@ func (r *Raft) processRequestVoteResponse(msg *voteRespMsg) {
 
 	if r.state == Candidate && msg.resp.Term == r.currentTerm && msg.resp.VoteGranted {
 		r.votesReceived[msg.peerID] = true
-		majority := (len(r.peers)+1)/2 + 1
-		if len(r.votesReceived) >= majority {
-			r.transitionToLeader()
+
+		// Use config-aware majority check if available
+		if r.currentConfig != nil {
+			if r.currentConfig.HasMajority(r.id, r.votesReceived) {
+				r.transitionToLeader()
+			}
+		} else {
+			// Legacy: simple majority of peers + self
+			majority := (len(r.peers)+1)/2 + 1
+			if len(r.votesReceived) >= majority {
+				r.transitionToLeader()
+			}
 		}
 	}
 }
@@ -670,21 +885,31 @@ func (r *Raft) processAppendEntriesResponse(msg *appendRespMsg) {
 
 	if r.state == Leader && msg.resp.Term == r.currentTerm {
 		if msg.resp.Success {
+			oldMatch := r.matchIndex[msg.peerID]
 			r.matchIndex[msg.peerID] = msg.resp.MatchIndex
 			r.nextIndex[msg.peerID] = msg.resp.MatchIndex + 1
 
-			// Check for commit progression
-			majority := (len(r.peers)+1)/2 + 1
+			// Record replication lag for any newly acknowledged indexes
+			for idx := oldMatch + 1; idx <= msg.resp.MatchIndex; idx++ {
+				if t, ok := r.proposalTime[idx]; ok {
+					RaftReplicationLagMs.Observe(float64(time.Since(t).Milliseconds()), msg.peerID)
+				}
+			}
+
+			// Clean up proposalTime map if it gets too large
+			if len(r.proposalTime) > 1000 {
+				for idx := range r.proposalTime {
+					if idx < r.commitIndex - 500 {
+						delete(r.proposalTime, idx)
+					}
+				}
+			}
+
+			// Check for commit progression using config-aware majority
 			lastIdx := r.lastLogIndex()
 			for n := r.commitIndex + 1; n <= lastIdx; n++ {
 				if r.getEntryTerm(n) == r.currentTerm {
-					count := 1 // self
-					for _, mIdx := range r.matchIndex {
-						if mIdx >= n {
-							count++
-						}
-					}
-					if count >= majority {
+					if r.checkCommitMajority(n) {
 						r.commitIndex = n
 						r.applyLogs()
 					}
@@ -699,6 +924,32 @@ func (r *Raft) processAppendEntriesResponse(msg *appendRespMsg) {
 			go r.replicateToPeer(msg.peerID)
 		}
 	}
+}
+
+// checkCommitMajority checks if log entry at index n has been replicated to
+// a majority under the current cluster configuration.
+func (r *Raft) checkCommitMajority(n int64) bool {
+	if r.currentConfig != nil {
+		// Build the set of nodes that have this entry
+		voters := make(map[string]bool)
+		voters[r.id] = true // leader always has it
+		for peerID, mIdx := range r.matchIndex {
+			if mIdx >= n {
+				voters[peerID] = true
+			}
+		}
+		return r.currentConfig.HasMajority(r.id, voters)
+	}
+
+	// Legacy: simple majority
+	majority := (len(r.peers)+1)/2 + 1
+	count := 1 // self
+	for _, mIdx := range r.matchIndex {
+		if mIdx >= n {
+			count++
+		}
+	}
+	return count >= majority
 }
 
 func (r *Raft) processInstallSnapshot(req *raftproto.InstallSnapshotRequest) *raftproto.InstallSnapshotResponse {
@@ -769,6 +1020,8 @@ func (r *Raft) handleClientCommand(msg cmdReq) {
 		msg.resp <- cmdResp{success: false, err: err}
 		return
 	}
+	RaftLogEntriesTotal.Inc()
+	r.proposalTime[entry.Index] = time.Now()
 
 	p := &proposal{
 		index:  entry.Index,
@@ -780,12 +1033,198 @@ func (r *Raft) handleClientCommand(msg cmdReq) {
 	r.broadcastHeartbeats()
 }
 
+// handleConfigChange processes a config change request (add/remove node).
+// Implements the joint consensus protocol from §6 of the Raft paper.
+func (r *Raft) handleConfigChange(msg configChangeReq) {
+	if r.state != Leader {
+		msg.resp <- cmdResp{success: false, err: errors.New("not the leader")}
+		return
+	}
+
+	if r.pendingConfig {
+		msg.resp <- cmdResp{success: false, err: errors.New("config change already in flight")}
+		return
+	}
+
+	if r.currentConfig == nil {
+		msg.resp <- cmdResp{success: false, err: errors.New("cluster configuration not initialized")}
+		return
+	}
+
+	// Build the joint config C_old,new
+	jointConfig, err := BuildJointConfig(r.currentConfig, r.id, msg.req)
+	if err != nil {
+		msg.resp <- cmdResp{success: false, err: err}
+		return
+	}
+
+	// Serialize the joint config as a config-change log entry
+	configData, err := EncodeConfigChangeEntry(jointConfig)
+	if err != nil {
+		msg.resp <- cmdResp{success: false, err: fmt.Errorf("failed to encode config change: %w", err)}
+		return
+	}
+
+	entry := &raftproto.LogEntry{
+		Index:   r.lastLogIndex() + 1,
+		Term:    r.currentTerm,
+		Command: configData,
+	}
+
+	r.log = append(r.log, entry)
+	if err := r.wal.AppendEntry(entry); err != nil {
+		r.logError("Failed to save config-change entry: %v", err)
+		msg.resp <- cmdResp{success: false, err: err}
+		return
+	}
+	r.proposalTime[entry.Index] = time.Now()
+
+	r.pendingConfig = true
+	r.configChangeIndex = entry.Index
+
+	// Apply the joint config immediately on the leader (per Raft paper:
+	// servers use the newest config in their log, regardless of commit status)
+	r.applyConfigEntry(jointConfig)
+
+	r.logInfo("Proposed joint consensus config change at index %d (joint=%v)", entry.Index, jointConfig.Joint)
+
+	// Connect to any new peers
+	r.connectToNewPeers()
+
+	p := &proposal{
+		index:  entry.Index,
+		term:   entry.Term,
+		respCh: msg.resp,
+	}
+	r.proposals = append(r.proposals, p)
+
+	r.broadcastHeartbeats()
+}
+
+// applyConfigEntry updates the node's active configuration.
+func (r *Raft) applyConfigEntry(config *ClusterConfig) {
+	r.currentConfig = config
+
+	// Sync the legacy peers map for backward compatibility
+	r.peers = r.currentConfig.AllNodeGRPC(r.id)
+	r.peerHTTPAddrs = r.currentConfig.AllNodeHTTP(r.id)
+
+	if config.ContainsNode(r.id) {
+		r.isJoining = false
+	} else {
+		r.isJoining = true // If removed from active cluster config, stop initiating elections!
+	}
+
+	r.logInfo("Applied config: joint=%v, new_peers=%v", config.Joint, mapKeys(config.NewPeers))
+	if config.Joint {
+		r.logInfo("  old_peers=%v", mapKeys(config.OldPeers))
+	}
+}
+
+// connectToNewPeers establishes gRPC connections to any peers in the current
+// config that don't already have connections.
+func (r *Raft) connectToNewPeers() {
+	allPeers := r.effectivePeers()
+	for peerID, addr := range allPeers {
+		if _, exists := r.grpcPeers[peerID]; exists {
+			continue
+		}
+
+		creds, err := transport.LoadClientCredentials(r.caCertPath, r.nodeCertPath, r.nodeKeyPath, r.peerServerName)
+		if err != nil {
+			r.logError("Failed to load credentials for new peer %s: %v", peerID, err)
+			continue
+		}
+
+		conn, err := grpc.Dial(addr, grpc.WithTransportCredentials(creds))
+		if err != nil {
+			r.logError("Failed to dial new peer %s at %s: %v", peerID, addr, err)
+			continue
+		}
+
+		r.grpcPeers[peerID] = &peerClient{
+			cli:  raftproto.NewRaftServiceClient(conn),
+			conn: conn,
+		}
+
+		// Initialize replication state for the new peer
+		r.nextIndex[peerID] = r.lastLogIndex() + 1
+		r.matchIndex[peerID] = 0
+
+		r.logInfo("Connected to new peer %s at %s", peerID, addr)
+	}
+}
+
+// disconnectRemovedPeers closes connections to peers no longer in the config.
+func (r *Raft) disconnectRemovedPeers() {
+	allPeers := r.effectivePeers()
+	for peerID, pc := range r.grpcPeers {
+		if _, exists := allPeers[peerID]; !exists {
+			pc.conn.Close()
+			delete(r.grpcPeers, peerID)
+			delete(r.nextIndex, peerID)
+			delete(r.matchIndex, peerID)
+			r.logInfo("Disconnected removed peer %s", peerID)
+		}
+	}
+}
+
 func (r *Raft) applyLogs() {
 	for r.lastApplied < r.commitIndex {
 		r.lastApplied++
+		RaftCommitIndex.Set(float64(r.lastApplied))
 		entry := r.getEntry(r.lastApplied)
-		if entry != nil && len(entry.Command) > 0 {
-			r.applyCommand(entry.Command)
+		if entry == nil || len(entry.Command) == 0 {
+			continue
+		}
+
+		// Decode the envelope to determine entry type
+		env, err := DecodeLogEntry(entry.Command)
+		if err != nil {
+			r.logError("Failed to decode log entry at index %d: %v", r.lastApplied, err)
+			continue
+		}
+
+		switch env.Type {
+		case EntryCommand:
+			r.applyCommand(env.Data)
+
+		case EntryConfigChange:
+			if env.Config != nil {
+				r.logInfo("Committing config-change entry at index %d (joint=%v)", r.lastApplied, env.Config.Joint)
+
+				if env.Config.Joint {
+					// C_old,new just committed. Now propose C_new (final config).
+					// Only the leader proposes the second phase.
+					if r.state == Leader {
+						r.proposeSecondPhaseConfig(env.Config)
+					}
+					// All servers apply the joint config
+					r.applyConfigEntry(env.Config)
+				} else {
+					// C_new (final config) committed.
+					r.applyConfigEntry(env.Config)
+					r.pendingConfig = false
+					r.configChangeIndex = 0
+
+					// Disconnect peers no longer in the config
+					r.disconnectRemovedPeers()
+
+					// If the leader is no longer in C_new, step down
+					if r.state == Leader && !env.Config.ContainsNode(r.id) {
+						// Self not in NewPeers means we've been removed
+						_, selfInNew := env.Config.NewPeers[r.id]
+						if !selfInNew {
+							r.logInfo("Leader stepping down: not in new configuration")
+							r.transitionToFollower(r.currentTerm)
+						}
+					}
+				}
+			}
+
+		case EntryNoop:
+			// No-op: nothing to apply to state machine
+			r.logDebug("Applied no-op entry at index %d", r.lastApplied)
 		}
 	}
 
@@ -810,7 +1249,40 @@ func (r *Raft) applyLogs() {
 	r.proposals = remaining
 }
 
+// proposeSecondPhaseConfig appends the final C_new config entry after C_old,new commits.
+func (r *Raft) proposeSecondPhaseConfig(jointConfig *ClusterConfig) {
+	finalConfig := BuildFinalConfig(jointConfig)
+
+	configData, err := EncodeConfigChangeEntry(finalConfig)
+	if err != nil {
+		r.logError("Failed to encode final config: %v", err)
+		return
+	}
+
+	entry := &raftproto.LogEntry{
+		Index:   r.lastLogIndex() + 1,
+		Term:    r.currentTerm,
+		Command: configData,
+	}
+
+	r.log = append(r.log, entry)
+	if err := r.wal.AppendEntry(entry); err != nil {
+		r.logError("Failed to save final config entry: %v", err)
+		return
+	}
+	r.proposalTime[entry.Index] = time.Now()
+
+	r.configChangeIndex = entry.Index
+	r.logInfo("Proposed final config C_new at index %d", entry.Index)
+
+	r.broadcastHeartbeats()
+}
+
 func (r *Raft) applyCommand(cmdBytes []byte) {
+	if len(cmdBytes) == 0 {
+		return
+	}
+
 	var cmd Command
 	if err := json.Unmarshal(cmdBytes, &cmd); err != nil {
 		r.logError("Failed to unmarshal command for application: %v", err)
@@ -839,6 +1311,17 @@ func (r *Raft) takeSnapshot() {
 		LastIncludedIndex: r.commitIndex,
 		LastIncludedTerm:  r.getEntryTerm(r.commitIndex),
 		KVState:           kvCopy,
+	}
+
+	// Persist cluster config in snapshot
+	if r.currentConfig != nil {
+		snap.ClusterConfig = &storage.ClusterConfigSnapshot{
+			OldPeers: copyMap(r.currentConfig.OldPeers),
+			NewPeers: copyMap(r.currentConfig.NewPeers),
+			OldHTTP:  copyMap(r.currentConfig.OldHTTP),
+			NewHTTP:  copyMap(r.currentConfig.NewHTTP),
+			Joint:    r.currentConfig.Joint,
+		}
 	}
 
 	if err := storage.SaveSnapshot(r.snapshotPath, snap); err != nil {
@@ -875,6 +1358,20 @@ func (r *Raft) restoreSnapshot(snap *storage.Snapshot) {
 	r.kv = make(map[string]string)
 	for k, v := range snap.KVState {
 		r.kv[k] = v
+	}
+
+	// Restore cluster config from snapshot
+	if snap.ClusterConfig != nil {
+		r.currentConfig = &ClusterConfig{
+			OldPeers: copyMap(snap.ClusterConfig.OldPeers),
+			NewPeers: copyMap(snap.ClusterConfig.NewPeers),
+			OldHTTP:  copyMap(snap.ClusterConfig.OldHTTP),
+			NewHTTP:  copyMap(snap.ClusterConfig.NewHTTP),
+			Joint:    snap.ClusterConfig.Joint,
+		}
+		r.peers = r.currentConfig.AllNodeGRPC(r.id)
+		r.peerHTTPAddrs = r.currentConfig.AllNodeHTTP(r.id)
+		r.logInfo("Restored cluster config from snapshot (joint=%v)", r.currentConfig.Joint)
 	}
 
 	var newLog []*raftproto.LogEntry
@@ -917,6 +1414,19 @@ func (r *Raft) loadState() error {
 		r.commitIndex = snap.LastIncludedIndex
 		r.lastApplied = snap.LastIncludedIndex
 		r.logInfo("Loaded snapshot up to index %d, term %d", r.lastIncludedIndex, r.lastIncludedTerm)
+
+		// Restore cluster config from snapshot
+		if snap.ClusterConfig != nil {
+			r.currentConfig = &ClusterConfig{
+				OldPeers: copyMap(snap.ClusterConfig.OldPeers),
+				NewPeers: copyMap(snap.ClusterConfig.NewPeers),
+				OldHTTP:  copyMap(snap.ClusterConfig.OldHTTP),
+				NewHTTP:  copyMap(snap.ClusterConfig.NewHTTP),
+				Joint:    snap.ClusterConfig.Joint,
+			}
+			r.peers = r.currentConfig.AllNodeGRPC(r.id)
+			r.peerHTTPAddrs = r.currentConfig.AllNodeHTTP(r.id)
+		}
 	} else {
 		r.kv = make(map[string]string)
 	}
@@ -1014,7 +1524,7 @@ func (r *Raft) sendRequestVote(peerID string, term, lastLogIdx, lastLogTerm int6
 		return nil, errors.New("gRPC client connection not found")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	return pc.cli.RequestVote(ctx, &raftproto.RequestVoteRequest{
@@ -1038,7 +1548,7 @@ func (r *Raft) sendAppendEntries(peerID string, term, prevLogIdx, prevLogTerm in
 		return nil, errors.New("gRPC client connection not found")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	return pc.cli.AppendEntries(ctx, &raftproto.AppendEntriesRequest{
@@ -1064,7 +1574,7 @@ func (r *Raft) sendInstallSnapshot(peerID string, term, lastIncludedIndex, lastI
 		return nil, errors.New("gRPC client connection not found")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Millisecond)
 	defer cancel()
 
 	return pc.cli.InstallSnapshot(ctx, &raftproto.InstallSnapshotRequest{
@@ -1078,11 +1588,13 @@ func (r *Raft) sendInstallSnapshot(peerID string, term, lastIncludedIndex, lastI
 	})
 }
 
-func (r *Raft) connectToPeers() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+func (r *Raft) connectToPeersLocked() error {
+	allPeers := r.effectivePeers()
+	for peerID, addr := range allPeers {
+		if _, exists := r.grpcPeers[peerID]; exists {
+			continue // already connected
+		}
 
-	for peerID, addr := range r.peers {
 		creds, err := transport.LoadClientCredentials(r.caCertPath, r.nodeCertPath, r.nodeKeyPath, r.peerServerName)
 		if err != nil {
 			return fmt.Errorf("failed to load credentials for client mTLS connecting to %s: %w", peerID, err)
@@ -1099,6 +1611,12 @@ func (r *Raft) connectToPeers() error {
 		}
 	}
 	return nil
+}
+
+func (r *Raft) connectToPeers() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.connectToPeersLocked()
 }
 
 // --- gRPC Server Implementations ---
@@ -1118,6 +1636,8 @@ func (r *Raft) RequestVote(ctx context.Context, req *raftproto.RequestVoteReques
 		return res.(*raftproto.RequestVoteResponse), nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-r.shutdown:
+		return nil, status.Errorf(codes.Unavailable, "node is shutting down")
 	}
 }
 
@@ -1136,6 +1656,8 @@ func (r *Raft) AppendEntries(ctx context.Context, req *raftproto.AppendEntriesRe
 		return res.(*raftproto.AppendEntriesResponse), nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-r.shutdown:
+		return nil, status.Errorf(codes.Unavailable, "node is shutting down")
 	}
 }
 
@@ -1154,6 +1676,8 @@ func (r *Raft) InstallSnapshot(ctx context.Context, req *raftproto.InstallSnapsh
 		return res.(*raftproto.InstallSnapshotResponse), nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-r.shutdown:
+		return nil, status.Errorf(codes.Unavailable, "node is shutting down")
 	}
 }
 
@@ -1174,4 +1698,14 @@ func (r *Raft) logDebug(format string, v ...interface{}) {
 func (r *Raft) logError(format string, v ...interface{}) {
 	logMsg := fmt.Sprintf(format, v...)
 	fmt.Printf("[ERROR] [Node %s] %s\n", r.id, logMsg)
+}
+
+// --- utility helpers ---
+
+func mapKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

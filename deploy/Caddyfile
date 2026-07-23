@@ -1,0 +1,34 @@
+# Caddyfile reverse proxy template for public internet exposure of the Raft KV Store API.
+# Exposes the cluster leader's HTTP API behind HTTPS (Let's Encrypt).
+# Place this on your public VMs or a reverse proxy gateway.
+
+{
+    email your-email@example.com
+}
+
+# Replace with your actual domain name
+your-domain.com {
+    # Proxy requests to node1 HTTP endpoint by default.
+    # Note: Raft KV Store HTTP server handles redirection to the leader automatically
+    # using StatusTemporaryRedirect, which the client can follow.
+    reverse_proxy localhost:8080
+
+    # Enable compression for key/value payload transfers
+    encode gzip zstd
+
+    # Logging setup for request audit logs
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+    }
+
+    # Standard security headers to harden the endpoint
+    header {
+        Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer-when-downgrade"
+    }
+}

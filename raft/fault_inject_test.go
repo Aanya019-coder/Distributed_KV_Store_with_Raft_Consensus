@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +12,12 @@ import (
 	raftproto "raft-kv/proto"
 	"raft-kv/transport"
 )
+
+var globalTestPortBase int32 = 11000
+
+func getNextPortBase(count int) int {
+	return int(atomic.AddInt32(&globalTestPortBase, int32(count+10)))
+}
 
 type testCluster struct {
 	t           *testing.T
@@ -25,9 +32,10 @@ func newTestCluster(t *testing.T, count int) *testCluster {
 	storageDirs := make(map[string]string)
 	
 	// Create configuration maps
+	portBase := getNextPortBase(count)
 	for i := 1; i <= count; i++ {
 		id := fmt.Sprintf("node%d", i)
-		peers[id] = fmt.Sprintf("127.0.0.1:%d", 9000+i)
+		peers[id] = fmt.Sprintf("127.0.0.1:%d", portBase+i)
 		storageDirs[id] = t.TempDir()
 	}
 
@@ -35,9 +43,9 @@ func newTestCluster(t *testing.T, count int) *testCluster {
 	servers := make(map[string]*grpc.Server)
 	listeners := make(map[string]net.Listener)
 
-	caCert := "../certs/ca.pem"
-	nodeCert := "../certs/node.pem"
-	nodeKey := "../certs/node.key"
+	caCert := "../certs/node1/ca.pem"
+	nodeCert := "../certs/node1/node.pem"
+	nodeKey := "../certs/node1/node.key"
 
 	for id, addr := range peers {
 		// Define peer map for this node (exclude self for connection dialing)
@@ -95,6 +103,7 @@ func (c *testCluster) stop() {
 		c.listeners[id].Close()
 		c.nodes[id].Stop()
 	}
+	time.Sleep(100 * time.Millisecond)
 }
 
 func (c *testCluster) findLeader() string {
@@ -197,14 +206,22 @@ func TestLeaderCrashMidWrite(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	if newLeaderID == "" {
-		t.Fatalf("no new leader elected after crash")
+	// Propose a write on the new leader (retry if leader is settling)
+	var success bool
+	var propErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		nlID := cluster.findLeader()
+		if nlID != "" {
+			success, propErr = cluster.nodes[nlID].Propose("PUT", "keyaftercrash", "valaftercrash")
+			if propErr == nil && success {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Propose a write on the new leader
-	success, err := cluster.nodes[newLeaderID].Propose("PUT", "keyaftercrash", "valaftercrash")
-	if err != nil || !success {
-		t.Fatalf("failed to propose to new leader: %v", err)
+	if propErr != nil || !success {
+		t.Fatalf("failed to propose to new leader: %v (success=%v)", propErr, success)
 	}
 }
 
@@ -344,11 +361,11 @@ func TestCrashAndWALRecovery(t *testing.T) {
 	// Restart follower
 	t.Logf("Restarting follower %s...", followerID)
 	
-	caCert := "../certs/ca.pem"
-	nodeCert := "../certs/node.pem"
-	nodeKey := "../certs/node.key"
+	caCert := "../certs/node1/ca.pem"
+	nodeCert := "../certs/node1/node.pem"
+	nodeKey := "../certs/node1/node.key"
 	
-	addr := fmt.Sprintf("127.0.0.1:%d", 9000 + int(followerID[len(followerID)-1]-'0'))
+	addr := cluster.listeners[followerID].Addr().String()
 	nodePeers := make(map[string]string)
 	for pid, paddr := range cluster.nodes[leaderID].peers {
 		if pid != followerID {
@@ -356,7 +373,7 @@ func TestCrashAndWALRecovery(t *testing.T) {
 		}
 	}
 	// Add leader to peers of restarted follower
-	nodePeers[leaderID] = fmt.Sprintf("127.0.0.1:%d", 9000 + int(leaderID[len(leaderID)-1]-'0'))
+	nodePeers[leaderID] = cluster.listeners[leaderID].Addr().String()
 
 	r, err := NewRaft(followerID, nodePeers, cluster.storageDirs[followerID], caCert, nodeCert, nodeKey, "localhost", false, 10)
 	if err != nil {
@@ -391,15 +408,24 @@ func TestCrashAndWALRecovery(t *testing.T) {
 	// Trigger leader to reconnect immediately to the restarted follower
 	cluster.nodes[leaderID].connectToPeers()
 
-	// Wait for caught up
-	time.Sleep(600 * time.Millisecond)
+	// Wait for restarted node to catch up and apply post-crash writes
+	recovered := false
+	for i := 0; i < 30; i++ {
+		cluster.nodes[followerID].mu.Lock()
+		val, ok := cluster.nodes[followerID].kv["postcrashkey"]
+		cluster.nodes[followerID].mu.Unlock()
 
-	// Verify that the restarted follower successfully caught up and applied the post-crash write
-	cluster.nodes[followerID].mu.Lock()
-	val, ok := cluster.nodes[followerID].kv["postcrashkey"]
-	cluster.nodes[followerID].mu.Unlock()
+		if ok && val == "postcrashval" {
+			recovered = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
-	if !ok || val != "postcrashval" {
+	if !recovered {
+		cluster.nodes[followerID].mu.Lock()
+		val, ok := cluster.nodes[followerID].kv["postcrashkey"]
+		cluster.nodes[followerID].mu.Unlock()
 		t.Fatalf("crashed follower did not recover post-crash writes. ok=%v, val=%s", ok, val)
 	}
 

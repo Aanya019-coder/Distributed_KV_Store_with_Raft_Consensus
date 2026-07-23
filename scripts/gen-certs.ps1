@@ -35,6 +35,14 @@ DNS.3 = node2
 DNS.4 = node3
 IP.1 = 127.0.0.1
 "@
+
+if ($env:EXTRA_SANS) {
+    $extra = $env:EXTRA_SANS -split ','
+    foreach ($san in $extra) {
+        $ext += "`n" + $san.Trim()
+    }
+}
+
 Set-Content -Path certs/node.ext -Value $ext -Encoding Ascii
 
 # 4. Sign Node certificate
