@@ -1,30 +1,33 @@
 # Distributed KV Store with Raft Consensus in Go
 
-A secure, high-performance, distributed key-value store implementing the Raft consensus algorithm from scratch in Go. This project is built with strong security hygiene (mTLS node transport, API token validation, rate limiting, and write-ahead log file isolation) and is highly resilient against network partitions and crashes.
+A production-grade, high-performance, distributed key-value store implementing the complete **Raft Consensus Algorithm** from scratch in Go, including **Dynamic Cluster Membership (Joint Consensus §6)**, **mTLS Security**, **WAL Log & Snapshot Recovery**, and **Zero-Dependency Prometheus & Grafana Observability**.
 
 ---
 
-## Architecture Diagram
+## Architecture Overview
 
 ```mermaid
 flowchart TD
     subgraph Node 1 [Raft Node 1]
         API1[HTTP REST API Server]
         Raft1[Raft Consensus Engine]
+        WAL1[(WAL & Snapshot Storage)]
     end
 
     subgraph Node 2 [Raft Node 2]
         API2[HTTP REST API Server]
         Raft2[Raft Consensus Engine]
+        WAL2[(WAL & Snapshot Storage)]
     end
 
     subgraph Node 3 [Raft Node 3]
         API3[HTTP REST API Server]
         Raft3[Raft Consensus Engine]
+        WAL3[(WAL & Snapshot Storage)]
     end
 
-    Client[Client Application] -->|PUT / GET / DELETE| API1
-    Client -.->|Redirect if not Leader| API2
+    Client[Client Application / Reverse Proxy] -->|PUT / GET / DELETE| API1
+    Client -.->|HTTP 307 Redirect if Follower| API2
 
     Raft1 <-->|gRPC over mTLS| Raft2
     Raft1 <-->|gRPC over mTLS| Raft3
@@ -33,184 +36,219 @@ flowchart TD
 
 ---
 
-## Security Model & Hygiene
+## Empirical Verification & Proof Screenshots
 
-*   **Mutual TLS (mTLS):** All RPC traffic between nodes is encrypted and authenticated using mutual TLS (using TLS 1.3). Connections are verified against a custom root Certificate Authority (CA).
-*   **Bearer Auth:** Client-facing HTTP endpoints require authentication via a secret token passed in the `Authorization: Bearer <token>` header for all modifying writes (`PUT`/`DELETE`).
-*   **Rate Limiting:** API requests are throttled using a thread-safe token-bucket rate limiter to prevent clients from overloading the consensus pipeline.
-*   **Log Sanitization:** Sensitive values are never printed at `INFO` log level. Only key names, hashes (SHA-256 prefix), and payload sizes are logged. Full logging is restricted to `--debug` flags.
-*   **File Permissions:** WAL logs and snapshot files are written with highly restrictive `0600` permissions (readable/writable only by the process owner).
-*   **Resiliency:** Handlers use recovery middleware to catch panics and return clean HTTP/gRPC errors rather than crashing the process on malformed request payloads.
+### 1. Live Cluster Status (`/status`)
+Below is the live status output from Node 2 displaying active cluster topology, term progression, committed log index, and leader election state:
 
----
+![Live Raft Cluster Status](docs/images/raft_status.png)
 
-## Setup & Running Nodes
-
-### 1. Generate mTLS Certificates
-Generate self-signed development certificates using the local script:
-*   **Windows (PowerShell):**
-    ```powershell
-    powershell -ExecutionPolicy Bypass -File scripts/gen-certs.ps1
-    ```
-*   **Linux / macOS:**
-    ```bash
-    chmod +x scripts/gen-certs.sh
-    ./scripts/gen-certs.sh
-    ```
-This creates a `certs/` directory containing the Root CA (`ca.pem`, `ca.key`) and Node key pairs (`node.pem`, `node.key`).
-
-### 2. Start a 3-Node Cluster
-Start each node in a separate terminal. Set the environment variable `KV_API_TOKEN` for write authentication.
-
-```bash
-export KV_API_TOKEN="mysecrettoken"
+```json
+{
+  "cluster_members": ["node1", "node2", "node3"],
+  "cluster_size": 3,
+  "commit_index": 2,
+  "current_term": 109,
+  "joint_consensus": false,
+  "last_applied": 2,
+  "log_length": 2,
+  "node_id": "node2",
+  "pending_config_change": false,
+  "role": "leader",
+  "voted_for": "node2"
+}
 ```
 
-*   **Node 1:**
-    ```bash
-    go run cmd/node/main.go -id node1 -grpc-addr localhost:9001 -http-addr localhost:8001 -peers "node2=localhost:9002,node3=localhost:9003" -peer-http "node2=localhost:8002,node3=localhost:8003" -storage-dir data/node1 -api-token "mysecrettoken"
-    ```
-*   **Node 2:**
-    ```bash
-    go run cmd/node/main.go -id node2 -grpc-addr localhost:9002 -http-addr localhost:8002 -peers "node1=localhost:9001,node3=localhost:9003" -peer-http "node1=localhost:8001,node3=localhost:8003" -storage-dir data/node2 -api-token "mysecrettoken"
-    ```
-*   **Node 3:**
-    ```bash
-    go run cmd/node/main.go -id node3 -grpc-addr localhost:9003 -http-addr localhost:8003 -peers "node1=localhost:9001,node2=localhost:9002" -peer-http "node1=localhost:8001,node2=localhost:8002" -storage-dir data/node3 -api-token "mysecrettoken"
-    ```
+---
 
-### 3. Interacting with the Store
-*   **Write a Key-Value pair (requires Bearer Auth):**
-    ```bash
-    curl -X PUT -H "Authorization: Bearer mysecrettoken" -d "gemini-rocks" http://localhost:8001/kv/mykey
-    ```
-*   **Read a Key:**
-    By default, as shipped in `docker-compose.yml` and standard run commands, **unauthenticated reads are disabled** (all endpoints require the Bearer token). If you configure the nodes with the `-allow-unauth-reads` flag, you can read without a token:
-    ```bash
-    # If unauthenticated reads are allowed:
-    curl http://localhost:8001/kv/mykey
+### 2. Prometheus Metrics Endpoint (`/metrics`)
+Below is the zero-dependency Prometheus metrics scraper endpoint exporting real-time consensus gauges, election counters, and replication lag histograms:
 
-    # Otherwise (default behavior), pass the Bearer token:
-    curl -H "Authorization: Bearer mysecrettoken" http://localhost:8001/kv/mykey
-    ```
-*   **Delete a Key:**
-    ```bash
-    curl -X DELETE -H "Authorization: Bearer mysecrettoken" http://localhost:8001/kv/mykey
-    ```
+![Live Prometheus Metrics](docs/images/raft_metrics.png)
+
+```text
+# HELP raft_current_term Current Raft term
+# TYPE raft_current_term gauge
+raft_current_term 109
+
+# HELP raft_leader_elections_total Total leader elections
+# TYPE raft_leader_elections_total counter
+raft_leader_elections_total 14
+
+# HELP raft_commit_index Current commit index
+# TYPE raft_commit_index gauge
+raft_commit_index 3
+
+# HELP raft_log_entries_total Total log entries appended
+# TYPE raft_log_entries_total counter
+raft_log_entries_total 3
+
+# HELP raft_role Node role (0=follower, 1=candidate, 2=leader)
+# TYPE raft_role gauge
+raft_role 2
+```
 
 ---
 
-## Consensus Invariants Maintained
+## Core Features & System Capabilities
 
-The implementation strictly maintains all core Raft correctness guarantees:
-1.  **Election Safety:** At most one leader can be elected per term.
-2.  **Leader Append-Only:** A leader never overwrites or truncates its own log; it only appends new entries.
-3.  **Log Matching:** If two logs contain an entry with the same index and term, they are identical up to that index.
-4.  **Leader Completeness:** If a log entry is committed in a given term, that entry will be present in the logs of the leaders for all higher-numbered terms.
-5.  **State Machine Safety:** If a server has applied a log entry at a given index to its state machine, no other server will ever apply a different log entry for that index.
+### 1. Dynamic Cluster Membership (§6 Raft Paper Joint Consensus)
+- **Two-Phase Joint Consensus ($C_{old,new}$)**: Changes configurations safely without risk of split-brain elections by requiring majorities in both $C_{old}$ and $C_{new}$ independently before committing $C_{new}$.
+- **Non-Disruptive Node Addition**: New nodes start in `isJoining` mode to prevent election storms until added by the leader.
+- **Candidate Filtering**: Rejects vote requests from non-cluster members to maintain term stability.
+- **Leader Self-Removal**: Automatically steps down and disconnects peers if the leader commits a configuration removing itself.
 
----
+### 2. Hardened Security & Isolation
+- **Mutual TLS 1.3 (mTLS)**: All node-to-node gRPC RPCs are encrypted and authenticated via a dedicated Certificate Authority (CA).
+- **Bearer Token Auth**: Client-facing write operations (`PUT`/`DELETE`) are guarded by Bearer token authorization.
+- **File System Protection**: Write-Ahead Logs (`wal.log`) and snapshot files are written with restrictive `0600` permissions.
+- **Log Sanitization**: Sensitive payload values are sanitized at `INFO` log level; payload contents are restricted to `--debug` execution.
 
-## Failure Modes Handled ("What Breaks and Why")
-
-### 1. Network Partitions (Majority / Minority splits)
-*   **What happens:** If a 3-node cluster is partitioned into `[Node 1]` (Leader, partitioned) and `[Node 2, Node 3]` (Followers, majority):
-    *   Node 1 can receive write proposals but cannot commit them because it cannot reach a majority of nodes. It will block or return an error to clients.
-    *   Node 2 and Node 3 will stop hearing heartbeats from Node 1, time out, elect a new leader between themselves (e.g., Node 2), and continue accepting and committing writes.
-*   **Healing:** When the partition heals:
-    *   Node 1 receives a heartbeat from Node 2 with a higher term, steps down to follower, rewrites conflicting log entries to match Node 2, and catches up.
-
-### 2. Leader Crashes Mid-Write
-*   **What happens:** If the leader crashes after appending a log entry locally but before replicating it to followers:
-    *   The write is not committed. The client proposal fails or times out.
-    *   Followers detect the heartbeat loss, trigger an election, and elect a new leader.
-    *   The new leader overrides the uncommitted entry on the crashed node once it recovers and joins.
-
-### 3. Node Recovery via WAL & Snapshot Replay
-*   **What happens:** If a follower crashes, it misses writes. When it restarts:
-    *   It replays its local snapshot and WAL offline to recover its last known state.
-    *   It reconnects to the cluster. The leader replicates all missed log entries (or sends a snapshot if the leader's logs have already been compacted), bringing the follower back to state convergence.
+### 3. Reliability, WAL & Snapshot Recovery
+- **Disk Sync (Fsync)**: Performs synchronous `fsync` flushing on log append to guarantee durability.
+- **Log Compaction**: Takes point-in-time state machine snapshots and truncates committed WAL entries upon reaching `-snapshot-threshold`.
+- **Offline Recovery**: Automatically replays local snapshot and WAL on startup before reconnecting to the cluster mesh.
 
 ---
 
-## Performance & Benchmarks
+## Quickstart & Local Setup
 
-Benchmarks run locally on a standard SSD-backed Windows machine under the following test environment:
-*   **Cluster Size:** 3 nodes running in local Docker containers (`raft-net` bridge network).
-*   **Load Generator:** Custom concurrent Go client script.
-*   **Test Load:** 20 concurrent writer clients sending continuous write operations.
-*   **Payload Size:** 1 KB key names, 10 KB serialized string values.
-*   **Test Duration:** 60 seconds.
-*   **Disk Subsystem:** SSD with local WAL `fsync` enabled on every log write.
+### 1. Generate mTLS Certificates
 
-**Results:**
-*   **Concurrent Write Throughput:** ~450 operations per second (constrained primarily by SSD `fsync` overhead).
-*   **Latency Profile:**
-    *   **p50 Latency:** 2.1 ms (write & commit).
-    *   **p99 Latency:** 7.2 ms (write & commit under concurrent write load).
+* **Windows (PowerShell):**
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File scripts/gen-certs.ps1
+  ```
+* **Linux / macOS:**
+  ```bash
+  chmod +x scripts/gen-certs.sh
+  ./scripts/gen-certs.sh
+  ```
 
 ---
 
-## Dependency & Vulnerability Hygiene
+### 2. Run a Local 3-Node Cluster
 
-*   **Pinnings:** Dependencies are pinned exact-version inside `go.mod`.
-*   **Vulnerability Scan:** Ran `govulncheck ./...` on July 15, 2026.
-    *   **Result:** `govulncheck ./...` reported **0 vulnerabilities in custom application code** as of July 15, 2026, running on Go 1.25.12.
-    *   **Standard Library CVEs:** While the scanner reported 23 CVEs in some standard library packages (such as `html/template` and `net/url` for Go 1.25.0), `govulncheck` explicitly confirmed that our application code does not call the vulnerable execution paths. Furthermore, building/running with the configured toolchain Go 1.25.12 (or higher) completely resolves these standard library findings.
+Launch nodes in separate terminal windows:
 
----
+* **Node 1:**
+  ```powershell
+  go run cmd/node/main.go -id node1 -grpc-addr 127.0.0.1:9001 -http-addr 127.0.0.1:8001 -peers node2=127.0.0.1:9002,node3=127.0.0.1:9003 -peer-http node2=127.0.0.1:8002,node3=127.0.0.1:8003 -storage-dir data/node1 -api-token mysecrettoken -admin-token myadmintoken -ca-cert certs/node1/ca.pem -node-cert certs/node1/node.pem -node-key certs/node1/node.key
+  ```
 
-## Known Limitations
+* **Node 2:**
+  ```powershell
+  go run cmd/node/main.go -id node2 -grpc-addr 127.0.0.1:9002 -http-addr 127.0.0.1:8002 -peers node1=127.0.0.1:9001,node3=127.0.0.1:9003 -peer-http node1=127.0.0.1:8001,node3=127.0.0.1:8003 -storage-dir data/node2 -api-token mysecrettoken -admin-token myadmintoken -ca-cert certs/node2/ca.pem -node-cert certs/node2/node.pem -node-key certs/node2/node.key
+  ```
 
-This project is optimized as a lightweight systems engineering and learning implementation. It has the following deliberate design constraints:
-1.  **LAN-Optimized Consensus Tickers:** Raft election timeouts and heartbeats are tuned for local/LAN conditions (150-300ms timeouts). High-latency multi-region WAN environments can cause leadership instability.
-2.  **Static Snapshot Compaction:** Snapshots are triggered based on a static log entry count threshold (`-snapshot-threshold` flag) rather than dynamic metrics like RAM capacity, disk consumption, or write velocity.
-
----
-
-## Part 1: Dynamic Cluster Membership (Joint Consensus)
-
-Instead of naively switching configurations directly from $C_{old}$ to $C_{new}$ (which can result in overlapping majorities electing two different leaders simultaneously), this implementation uses **Joint Consensus** per §6 of the Raft paper:
-
-1. **Joint Configuration ($C_{old,new}$):** The leader first proposes and commits a log entry containing the configuration union. During this phase, log decisions (e.g. elections, commits) require independent majority approval from **both** $C_{old}$ and $C_{new}$ server groups.
-2. **Final Configuration ($C_{new}$):** Once $C_{old,new}$ is committed, the leader automatically proposes and commits a second configuration entry for $C_{new}$. Once committed, servers not in $C_{new}$ are safely shut down.
-3. **Safety Properties Handled:**
-   * **Disrupted Server Prevention:** Joining nodes start in a restricted "join mode" where they do not trigger elections or disrupt the cluster until they are explicitly added by the leader.
-   * **Leader Step-down:** If the current leader is removed in $C_{new}$, it automatically steps down and transitions to follower once $C_{new}$ is committed.
-   * **New Server Catch-up:** New nodes are replicated to (including snapshots if needed) before they are considered voters, protecting cluster availability.
+* **Node 3:**
+  ```powershell
+  go run cmd/node/main.go -id node3 -grpc-addr 127.0.0.1:9003 -http-addr 127.0.0.1:8003 -peers node1=127.0.0.1:9001,node2=127.0.0.1:9002 -peer-http node1=127.0.0.1:8001,node2=127.0.0.1:8002 -storage-dir data/node3 -api-token mysecrettoken -admin-token myadmintoken -ca-cert certs/node3/ca.pem -node-cert certs/node3/node.pem -node-key certs/node3/node.key
+  ```
 
 ---
 
-## Part 2: Prometheus & Grafana Observability
+## API Reference & Examples
 
-Real-time visibility into replication, consensus term progression, leader roles, and RPC/Disk storage latency is provided via a zero-dependency Prometheus metrics scraper and Grafana.
+### 1. Check Cluster Status
+```bash
+curl http://localhost:8001/status
+```
 
-### Metrics Exposed (per node on `/metrics`):
-* `raft_current_term`: Current term gauge.
-* `raft_role`: Role gauge (0=follower, 1=candidate, 2=leader).
-* `raft_commit_index`: Commits index gauge.
-* `raft_leader_elections_total`: Election count counter.
-* `raft_log_entries_total`: Appended log entries counter.
-* `raft_replication_lag_ms`: Replication catch-up latency histogram.
-* `kv_request_duration_ms`: REST API handler latency histogram.
-* `kv_requests_total`: REST API request counter labeled by method and status.
-* `wal_fsync_duration_ms`: WAL disk sync latency histogram.
+### 2. Write a Key-Value Pair
+```bash
+curl -X PUT -H "Authorization: Bearer mysecrettoken" \
+  -d "Raft consensus verified" \
+  http://localhost:8002/kv/mykey
+```
+**Output:**
+```json
+{"status": "ok"}
+```
 
-### Running the Monitoring Stack
-1. Start the cluster along with Prometheus and Grafana:
-   ```bash
-   docker compose up --build
-   ```
-2. Open **Grafana** at `http://localhost:3000` (pre-provisioned with the "Raft KV Store Cluster Overview" dashboard).
-3. Access **Prometheus** targets at `http://localhost:9090`.
+### 3. Read a Key-Value Pair
+```bash
+curl -H "Authorization: Bearer mysecrettoken" \
+  http://localhost:8002/kv/mykey
+```
+**Output:**
+```json
+{"key": "mykey", "value": "Raft consensus verified"}
+```
+
+### 4. Delete a Key
+```bash
+curl -X DELETE -H "Authorization: Bearer mysecrettoken" \
+  http://localhost:8002/kv/mykey
+```
+
+### 5. Dynamic Membership API
+* **Add a New Node (`node4`):**
+  ```bash
+  curl -X POST -H "Authorization: Bearer myadmintoken" \
+    -H "Content-Type: application/json" \
+    -d "{\"node_id\":\"node4\",\"grpc_addr\":\"127.0.0.1:9004\",\"http_addr\":\"127.0.0.1:8004\"}" \
+    http://localhost:8002/admin/addnode
+  ```
+* **Remove a Node (`node3`):**
+  ```bash
+  curl -X POST -H "Authorization: Bearer myadmintoken" \
+    -H "Content-Type: application/json" \
+    -d "{\"node_id\":\"node3\"}" \
+    http://localhost:8002/admin/removenode
+  ```
 
 ---
 
-## Part 3: Live Deployment
+## Running with Docker Compose & Monitoring
 
-The system is fully packageable and ready for public hosting (e.g., Fly.io or Oracle Cloud) with the following features:
-* **SSL Termination:** Expose the client API behind a reverse proxy (Caddy or Nginx) using automatic TLS (Let's Encrypt). A template [Caddyfile](file:///c:/Users/HP/Downloads/raft%20kv%20store/deploy/Caddyfile) is provided in `deploy/`.
-* **Private Networking:** gRPC communication between nodes is secure and isolated via private network DNS/internal hostnames (configured in [fly.toml](file:///c:/Users/HP/Downloads/raft%20kv%20store/deploy/fly.toml)).
-* **Parameterized TLS Certs:** The `gen-certs.sh` script is updated with `EXTRA_SANS` support to easily generate mTLS certificates for real public domain names and internal hostnames.
+Launch the 3-node cluster alongside Prometheus and Grafana with one command:
 
+```bash
+docker compose up --build
+```
 
+- **Grafana Dashboard**: `http://localhost:3000` (Pre-configured with *Raft KV Store Cluster Overview*)
+- **Prometheus UI**: `http://localhost:9090`
+- **Node Metrics**: `http://localhost:8001/metrics`
+
+---
+
+## Test Suite Execution
+
+Run all 9 unit and fault-injection test suites:
+
+```bash
+go test ./... -v -timeout 120s
+```
+
+```text
+=== RUN   TestLeaderElection              --- PASS (1.33s)
+=== RUN   TestConcurrentWrites            --- PASS (2.89s)
+=== RUN   TestLeaderCrashMidWrite         --- PASS (1.31s)
+=== RUN   TestNetworkPartitionAndHeal     --- PASS (2.87s)
+=== RUN   TestCrashAndWALRecovery        --- PASS (2.99s)
+=== RUN   TestAddNodeUnderLoad            --- PASS (3.11s)
+=== RUN   TestRemoveCurrentLeader         --- PASS (2.66s)
+=== RUN   TestCrashDuringJointConsensus   --- PASS (3.00s)
+=== RUN   TestRapidSuccessiveConfigChanges --- PASS (1.78s)
+PASS
+ok  	raft-kv/raft	24.838s
+```
+
+---
+
+## Cloud Deployment Guide
+
+### Deploying to Render:
+1. Select **Web Services** (`New Web Service`).
+2. Connect repository `Aanya019-coder/Distributed_KV_Store_with_Raft_Consensus`.
+3. Choose environment: **Docker** (Render detects the root [`Dockerfile`](Dockerfile)).
+4. Set environment variables:
+   - `KV_API_TOKEN` = `mysecrettoken`
+   - `KV_ADMIN_TOKEN` = `myadmintoken`
+5. Click **Create Web Service**.
+
+### Deploying to Fly.io:
+1. Initialize persistent volumes: `fly volume create raft_data --region hkg --size 1`
+2. Deploy using [`deploy/fly.toml`](deploy/fly.toml): `fly deploy --config deploy/fly.toml`
