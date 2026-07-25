@@ -96,6 +96,7 @@ func (s *Server) Start(addr string) error {
 	s.listener = l
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleRoot)
 	mux.HandleFunc("/kv/", s.handleKV)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/status", s.handleStatus)
@@ -275,6 +276,23 @@ func (s *Server) handleDelete(w http.ResponseWriter, key string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"status": "ok"}`))
 	success = true
+}
+
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"service":     "Distributed Key-Value Store with Raft Consensus",
+		"node_id":     s.raft.GetID(),
+		"status_url":  "/status",
+		"metrics_url": "/metrics",
+		"health_url":  "/healthz",
+		"kv_api":      "/kv/{key}",
+	})
 }
 
 // handleStatus returns the current cluster status. Public endpoint — no auth required.
