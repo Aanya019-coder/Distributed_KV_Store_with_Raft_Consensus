@@ -34,8 +34,22 @@ func main() {
 	debug := flag.Bool("debug", false, "Enable debug verbose logging")
 	flag.Parse()
 
-	if *nodeID == "" || *grpcAddr == "" || *httpAddr == "" || *storageDir == "" {
-		log.Fatalf("[ERROR] Missing required flags. Run with --help to see all options.")
+	if *nodeID == "" {
+		*nodeID = "node1"
+	}
+	if *grpcAddr == "" {
+		*grpcAddr = ":9000"
+	}
+	if *httpAddr == "" {
+		port := os.Getenv("PORT")
+		if port != "" {
+			*httpAddr = ":" + port
+		} else {
+			*httpAddr = ":8080"
+		}
+	}
+	if *storageDir == "" {
+		*storageDir = "/data"
 	}
 
 	// Resolve API Token from flag or env
