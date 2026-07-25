@@ -318,6 +318,13 @@ func (r *Raft) IsLeader() (bool, string) {
 	return false, r.votedFor
 }
 
+// GetID returns the unique node identifier.
+func (r *Raft) GetID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.id
+}
+
 // GetStatus returns the current node status for the /status endpoint.
 func (r *Raft) GetStatus() map[string]interface{} {
 	r.mu.Lock()
