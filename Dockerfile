@@ -1,6 +1,9 @@
 # Stage 1: Build the statically linked Go binary
 FROM golang:1.22-alpine AS builder
 
+# Install git and ca-certificates required by go mod for VCS dependencies
+RUN apk add --no-cache git ca-certificates
+
 WORKDIR /app
 
 # Copy dependency mappings and cache downloads
