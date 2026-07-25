@@ -1053,6 +1053,10 @@ func (r *Raft) handleClientCommand(msg cmdReq) {
 	r.proposals = append(r.proposals, p)
 
 	r.broadcastHeartbeats()
+	if len(r.effectivePeers()) == 0 && r.checkCommitMajority(entry.Index) {
+		r.commitIndex = entry.Index
+		r.applyLogs()
+	}
 }
 
 // handleConfigChange processes a config change request (add/remove node).
