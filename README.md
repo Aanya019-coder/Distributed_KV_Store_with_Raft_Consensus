@@ -1,6 +1,6 @@
 # Distributed KV Store with Raft Consensus in Go
 
-A production-grade, high-performance, distributed key-value store implementing the complete **Raft Consensus Algorithm** from scratch in Go, including **Dynamic Cluster Membership (Joint Consensus §6)**, **mTLS Security**, **WAL Log & Snapshot Recovery**, and **Zero-Dependency Prometheus & Grafana Observability**.
+A from-scratch implementation of the Raft Consensus Algorithm in Go, with production-inspired practices: Dynamic Cluster Membership (Joint Consensus §6), mTLS security, WAL log & snapshot recovery, and zero-dependency Prometheus & Grafana observability.
 
 ---
 
@@ -45,7 +45,11 @@ Below is the live status output from Node 2 displaying active cluster topology, 
 
 ```json
 {
-  "cluster_members": ["node1", "node2", "node3"],
+  "cluster_members": [
+    "node1",
+    "node2",
+    "node3"
+  ],
   "cluster_size": 3,
   "commit_index": 2,
   "current_term": 109,
@@ -238,7 +242,10 @@ ok  	raft-kv/raft	24.838s
 
 ---
 
-## Cloud Deployment Guide
+## Live Demo & Cloud Deployment Guide
+
+> [!NOTE]
+> Live single-node or cluster instances can be deployed on Fly.io or Render using the included deployment configurations. Set `KV_API_TOKEN` and `KV_ADMIN_TOKEN` as environment variables per the setup instructions below. Once deployed, replace the endpoint URL in your dashboard to access live `/status` and `/metrics`.
 
 ### Deploying to Render:
 1. Select **Web Services** (`New Web Service`).
@@ -252,3 +259,4 @@ ok  	raft-kv/raft	24.838s
 ### Deploying to Fly.io:
 1. Initialize persistent volumes: `fly volume create raft_data --region hkg --size 1`
 2. Deploy using [`deploy/fly.toml`](deploy/fly.toml): `fly deploy --config deploy/fly.toml`
+

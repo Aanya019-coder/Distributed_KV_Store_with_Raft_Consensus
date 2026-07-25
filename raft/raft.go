@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 	"sync"
 	"time"
 
@@ -341,21 +342,35 @@ func (r *Raft) GetStatus() map[string]interface{} {
 	}
 
 	if r.currentConfig != nil {
-		members := make([]string, 0)
-		members = append(members, r.id)
+		memberMap := make(map[string]bool)
 		for id := range r.currentConfig.NewPeers {
+			memberMap[id] = true
+		}
+		if r.currentConfig.Joint {
+			for id := range r.currentConfig.OldPeers {
+				memberMap[id] = true
+			}
+		}
+		members := make([]string, 0, len(memberMap))
+		for id := range memberMap {
 			members = append(members, id)
 		}
+		sort.Strings(members)
 		status["cluster_members"] = members
 		status["cluster_size"] = len(members)
 		status["joint_consensus"] = r.currentConfig.Joint
 		status["pending_config_change"] = r.pendingConfig
 	} else {
-		members := make([]string, 0)
-		members = append(members, r.id)
+		memberMap := make(map[string]bool)
+		memberMap[r.id] = true
 		for id := range r.peers {
+			memberMap[id] = true
+		}
+		members := make([]string, 0, len(memberMap))
+		for id := range memberMap {
 			members = append(members, id)
 		}
+		sort.Strings(members)
 		status["cluster_members"] = members
 		status["cluster_size"] = len(members)
 		status["joint_consensus"] = false

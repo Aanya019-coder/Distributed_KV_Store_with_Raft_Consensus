@@ -1,6 +1,6 @@
 module raft-kv
 
-go 1.25.0
+go 1.22
 
 require (
 	google.golang.org/grpc v1.82.0
