@@ -1,6 +1,6 @@
 # Distributed KV Store with Raft Consensus in Go
 
-A from-scratch implementation of the Raft Consensus Algorithm in Go, with production-inspired practices: Dynamic Cluster Membership (Joint Consensus §6), mTLS security, WAL log & snapshot recovery, and zero-dependency Prometheus & Grafana observability.
+A from-scratch implementation of the Raft Consensus Algorithm in Go, with production-inspired practices: Dynamic Cluster Membership (Joint Consensus Section 6), mTLS security, WAL log & snapshot recovery, and zero-dependency Prometheus & Grafana observability.
 
 ---
 
