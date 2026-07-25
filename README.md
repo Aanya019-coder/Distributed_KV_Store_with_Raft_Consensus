@@ -244,8 +244,11 @@ ok  	raft-kv/raft	24.838s
 
 ## Live Demo & Cloud Deployment Guide
 
-> [!NOTE]
-> Live single-node or cluster instances can be deployed on Fly.io or Render using the included deployment configurations. Set `KV_API_TOKEN` and `KV_ADMIN_TOKEN` as environment variables per the setup instructions below. Once deployed, replace the endpoint URL in your dashboard to access live `/status` and `/metrics`.
+> [!TIP]
+> **Live Deployed Instance**: [`https://raft-kv-node1.onrender.com`](https://raft-kv-node1.onrender.com)
+> - **Live Cluster Status**: [`https://raft-kv-node1.onrender.com/status`](https://raft-kv-node1.onrender.com/status)
+> - **Live Prometheus Metrics**: [`https://raft-kv-node1.onrender.com/metrics`](https://raft-kv-node1.onrender.com/metrics)
+> - **Live Health Check**: [`https://raft-kv-node1.onrender.com/healthz`](https://raft-kv-node1.onrender.com/healthz)
 
 ### Deploying to Render:
 1. Select **Web Services** (`New Web Service`).
