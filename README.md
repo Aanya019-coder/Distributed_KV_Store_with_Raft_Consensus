@@ -8,6 +8,7 @@ A production-grade, from-scratch implementation of the Raft Consensus Algorithm 
 - **Linearizable Reads via ReadIndex** (Quorum confirmation & leader lease read safety without log writes §8)
 - **Pre-Vote Algorithm** (Preventing partitioned candidate term disruption §9.6)
 - **Dynamic Cluster Membership** (Joint Consensus Section 6)
+- **Unified API Gateway & React Web Dashboard** (Real-time cluster topology, metrics, SSE event streaming, and KV console)
 - **mTLS Security**, **WAL & Snapshot Durability**, and zero-dependency **Prometheus & Grafana observability**.
 
 ---
@@ -16,28 +17,42 @@ A production-grade, from-scratch implementation of the Raft Consensus Algorithm 
 
 ```mermaid
 flowchart TD
-    subgraph Node 1 [Raft Node 1]
-        API1[HTTP REST API Server]
+    subgraph Frontend [User Interface]
+        WebUI[React Web Dashboard]
+    end
+
+    subgraph Edge Layer
+        GW[API Gateway / Load Balancer :8080]
+    end
+
+    subgraph Node 1 [Raft Node 1 :8001]
+        API1[HTTP REST API]
         Raft1[Raft Consensus Engine]
         WAL1[(WAL & Snapshot Storage)]
     end
 
-    subgraph Node 2 [Raft Node 2]
-        API2[HTTP REST API Server]
+    subgraph Node 2 [Raft Node 2 :8002]
+        API2[HTTP REST API]
         Raft2[Raft Consensus Engine]
         WAL2[(WAL & Snapshot Storage)]
     end
 
-    subgraph Node 3 [Raft Node 3]
-        API3[HTTP REST API Server]
+    subgraph Node 3 [Raft Node 3 :8003]
+        API3[HTTP REST API]
         Raft3[Raft Consensus Engine]
         WAL3[(WAL & Snapshot Storage)]
     end
 
-    Client[Client Application / Load Generator] -->|PUT / GET / DELETE| API1
-    Client -.->|HTTP 307 Redirect if Follower| API2
+    WebUI -->|REST / SSE Events| GW
+    GW -->|Auto Leader Forwarding| API1
+    GW -.->|Failover| API2
+    GW -.->|Failover| API3
 
-    Raft1 <-->|gRPC over mTLS & PreVote| Raft2
+    API1 --> Raft1
+    API2 --> Raft2
+    API3 --> Raft3
+
+    Raft1 <-->|gRPC over mTLS & PreVote :9001-9003| Raft2
     Raft1 <-->|gRPC over mTLS & PreVote| Raft3
     Raft2 <-->|gRPC over mTLS & PreVote| Raft3
 ```
@@ -59,7 +74,7 @@ Measured on a local 3-Node Raft cluster across varying concurrency workloads:
 
 Run benchmarks using the included load generator:
 ```bash
-go run bench/main.go -url http://127.0.0.1:8001 -concurrency 50 -duration 10 -op PUT
+go run bench/main.go -url http://127.0.0.1:8080 -concurrency 50 -duration 10 -op PUT
 ```
 
 ---
@@ -147,7 +162,24 @@ raft_role 2
 
 ## Quickstart & Local Setup
 
-### 1. Generate mTLS Certificates
+### 1. Docker Compose (Fastest All-in-One Setup)
+
+Launch the 3 Raft nodes, API Gateway, and Web Dashboard automatically:
+
+```bash
+docker compose up -d --build
+```
+Access the services at:
+- **API Gateway**: `http://localhost:8080`
+- **Node 1 REST API**: `http://localhost:8001`
+- **Node 2 REST API**: `http://localhost:8002`
+- **Node 3 REST API**: `http://localhost:8003`
+
+---
+
+### 2. Manual Local Setup
+
+#### Step A: Generate mTLS Certificates
 
 * **Windows (PowerShell):**
   ```powershell
@@ -159,49 +191,104 @@ raft_role 2
   ./scripts/gen-certs.sh
   ```
 
----
-
-### 2. Run a Local 3-Node Cluster
-
-Launch nodes in separate terminal windows:
+#### Step B: Launch 3 Raft Nodes
 
 * **Node 1:**
   ```powershell
   go run cmd/node/main.go -id node1 -grpc-addr 127.0.0.1:9001 -http-addr 127.0.0.1:8001 -peers node2=127.0.0.1:9002,node3=127.0.0.1:9003 -peer-http node2=127.0.0.1:8002,node3=127.0.0.1:8003 -storage-dir data/node1 -read-safety safe
   ```
-
 * **Node 2:**
   ```powershell
   go run cmd/node/main.go -id node2 -grpc-addr 127.0.0.1:9002 -http-addr 127.0.0.1:8002 -peers node1=127.0.0.1:9001,node3=127.0.0.1:9003 -peer-http node1=127.0.0.1:8001,node3=127.0.0.1:8003 -storage-dir data/node2 -read-safety safe
   ```
-
 * **Node 3:**
   ```powershell
   go run cmd/node/main.go -id node3 -grpc-addr 127.0.0.1:9003 -http-addr 127.0.0.1:8003 -peers node1=127.0.0.1:9001,node2=127.0.0.1:9002 -peer-http node1=127.0.0.1:8001,node2=127.0.0.1:8002 -storage-dir data/node3 -read-safety safe
   ```
 
+#### Step C: Launch API Gateway
+
+```powershell
+go run cmd/gateway/main.go -port 8080 -nodes http://127.0.0.1:8001,http://127.0.0.1:8002,http://127.0.0.1:8003
+```
+
+#### Step D: Launch React Web Dashboard
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+Open `http://localhost:5173` in your browser.
+
+---
+
+## 🚀 Detailed Deployment Guide
+
+### Option 1: Deployment on Fly.io (PaaS with Persistent Storage)
+
+Fly.io provides persistent volume storage (required for Raft WAL & snapshot durability) and internal private network routing between nodes.
+
+1. **Install Fly CLI**: `flyctl`
+2. **Deploy Gateway**:
+   ```bash
+   fly launch --dockerfile Dockerfile.gateway --name raft-api-gateway
+   ```
+3. **Deploy Multi-Node Raft Cluster with Persistent Volumes**:
+   Create persistent volumes for each node (`vol_node1`, `vol_node2`, `vol_node3`) and deploy using `fly deploy`.
+
+---
+
+### Option 2: Deployment on Single VPS (DigitalOcean / EC2 / Hetzner)
+
+Deploy the entire stack with a single command on any Linux VPS:
+
+1. SSH into your VPS:
+   ```bash
+   ssh root@<vps-ip>
+   ```
+2. Clone the repository:
+   ```bash
+   git clone https://github.com/Aanya019-coder/Distributed_KV_Store_with_Raft_Consensus.git
+   cd Distributed_KV_Store_with_Raft_Consensus
+   ```
+3. Generate mTLS certs and start services:
+   ```bash
+   ./scripts/gen-certs.sh
+   docker compose up -d --build
+   ```
+
+---
+
+### Option 3: Deploying Frontend Dashboard (Vercel / Netlify)
+
+1. Connect your GitHub repository to **[Vercel](https://vercel.com)**.
+2. Set the Root Directory to `frontend`.
+3. Set the Build Command: `npm run build` and Output Directory: `dist`.
+4. Set Environment Variable: `VITE_API_URL=https://<your-gateway-domain>`.
+
 ---
 
 ## API Reference & Examples
 
-### 1. Write Key (with Deduplication)
+### 1. Write Key (via API Gateway with Deduplication)
 ```bash
 curl -X PUT -H "Authorization: Bearer mysecrettoken" \
   -H "X-Client-ID: client-uuid-123" \
   -H "X-Request-ID: 1" \
   -d "Raft consensus verified" \
-  http://localhost:8002/kv/mykey
+  http://localhost:8080/kv/mykey
 ```
 
-### 2. Read Key (Linearizable ReadIndex)
+### 2. Read Key (Linearizable ReadIndex via Gateway)
 ```bash
 curl -H "Authorization: Bearer mysecrettoken" \
-  http://localhost:8002/kv/mykey
+  http://localhost:8080/kv/mykey
 ```
 
-### 3. Check Cluster Status
+### 3. Check Unified Cluster Status
 ```bash
-curl http://localhost:8001/status
+curl http://localhost:8080/status
 ```
 
 ---
