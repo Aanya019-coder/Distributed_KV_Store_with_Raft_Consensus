@@ -187,8 +187,24 @@ services:
     networks:
       - raft-net
     restart: unless-stopped
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    container_name: gateway
+    environment:
+      - GATEWAY_TOKEN=mysecrettoken
+      - KV_API_TOKEN=mysecrettoken
+      - NODE_ADDRS=node1:8080,node2:8080,node3:8080
+    ports:
+      - "7000:7000"
+    networks:
+      - raft-net
+    restart: unless-stopped
     depends_on:
-      - prometheus
+      - node1
+      - node2
+      - node3
 
 volumes:
   node1-data:

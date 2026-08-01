@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Raft Consensus Distributed KV Store - Live Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-dark: #0b0f19;
+      --bg-card: rgba(18, 24, 38, 0.75);
+      --bg-card-border: rgba(255, 255, 255, 0.08);
+      --accent-cyan: #00f2fe;
+      --accent-blue: #4facfe;
+      --accent-emerald: #10b981;
+      --accent-amber: #f59e0b;
+      --accent-purple: #8b5cf6;
+      --text-main: #f3f4f6;
+      --text-muted: #9ca3af;
+      --glow-leader: rgba(16, 185, 129, 0.25);
+      --glow-follower: rgba(79, 172, 254, 0.15);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Outfit', sans-serif;
+      background: radial-gradient(circle at 50% 0%, #172033 0%, #0b0f19 75%);
+      color: var(--text-main);
+      min-height: 100vh;
+      padding: 2rem;
+      overflow-x: hidden;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 2rem;
+      padding-bottom: 1.5rem;
+      border-bottom: 1px solid var(--bg-card-border);
+    }
+
+    .header-title {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .badge-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.4rem;
+      font-weight: 700;
+      box-shadow: 0 0 20px rgba(0, 242, 254, 0.4);
+    }
+
+    h1 {
+      font-size: 1.8rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #ffffff, #a5f3fc);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .subtitle {
+      font-size: 0.9rem;
+      color: var(--text-muted);
+    }
+
+    .live-indicator {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      padding: 0.5rem 1rem;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      color: var(--accent-emerald);
+      font-weight: 500;
+    }
+
+    .pulse-dot {
+      width: 8px;
+      height: 8px;
+      background-color: var(--accent-emerald);
+      border-radius: 50%;
+      box-shadow: 0 0 10px var(--accent-emerald);
+      animation: pulse 1.8s infinite;
+    }
+
+    @keyframes pulse {
+      0% { transform: scale(0.95); opacity: 0.8; }
+      50% { transform: scale(1.3); opacity: 1; }
+      100% { transform: scale(0.95); opacity: 0.8; }
+    }
+
+    /* Grid Layout */
+    .dashboard-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }
+
+    .node-card {
+      background: var(--bg-card);
+      backdrop-filter: blur(16px);
+      border: 1px solid var(--bg-card-border);
+      border-radius: 20px;
+      padding: 1.5rem;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .node-card.leader {
+      border-color: rgba(16, 185, 129, 0.4);
+      box-shadow: 0 10px 30px -10px var(--glow-leader);
+    }
+
+    .node-card.follower {
+      border-color: rgba(79, 172, 254, 0.2);
+      box-shadow: 0 10px 30px -10px var(--glow-follower);
+    }
+
+    .node-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1.2rem;
+    }
+
+    .node-id {
+      font-size: 1.3rem;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+
+    .role-badge {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      padding: 0.35rem 0.8rem;
+      border-radius: 8px;
+    }
+
+    .role-badge.leader {
+      background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(52, 211, 153, 0.2));
+      color: #34d399;
+      border: 1px solid rgba(52, 211, 153, 0.4);
+    }
+
+    .role-badge.follower {
+      background: rgba(79, 172, 254, 0.15);
+      color: var(--accent-blue);
+      border: 1px solid rgba(79, 172, 254, 0.3);
+    }
+
+    .metrics-row {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .metric-box {
+      background: rgba(0, 0, 0, 0.25);
+      padding: 0.8rem;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.04);
+    }
+
+    .metric-label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-bottom: 0.2rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .metric-value {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: #fff;
+    }
+
+    /* Bottom Sections */
+    .sections-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+    }
+
+    .panel {
+      background: var(--bg-card);
+      backdrop-filter: blur(16px);
+      border: 1px solid var(--bg-card-border);
+      border-radius: 20px;
+      padding: 1.5rem;
+    }
+
+    .panel-title {
+      font-size: 1.1rem;
+      font-weight: 600;
+      margin-bottom: 1.2rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .form-group {
+      margin-bottom: 1rem;
+    }
+
+    label {
+      display: block;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-bottom: 0.4rem;
+    }
+
+    input, textarea {
+      width: 100%;
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 10px;
+      padding: 0.75rem 1rem;
+      color: #fff;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    input:focus, textarea:focus {
+      border-color: var(--accent-cyan);
+    }
+
+    .btn-group {
+      display: flex;
+      gap: 0.75rem;
+    }
+
+    button {
+      flex: 1;
+      padding: 0.75rem;
+      border: none;
+      border-radius: 10px;
+      font-weight: 600;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+      color: #000;
+    }
+
+    .btn-primary:hover {
+      opacity: 0.9;
+      transform: translateY(-1px);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.08);
+      color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.15);
+    }
+
+    .result-console {
+      margin-top: 1rem;
+      background: rgba(0, 0, 0, 0.4);
+      border-radius: 12px;
+      padding: 1rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      color: #34d399;
+      min-height: 80px;
+      max-height: 140px;
+      overflow-y: auto;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .metrics-stream {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      color: #d1d5db;
+      background: rgba(0, 0, 0, 0.4);
+      padding: 1rem;
+      border-radius: 12px;
+      height: 230px;
+      overflow-y: auto;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      line-height: 1.6;
+    }
+
+    .metric-line {
+      display: flex;
+      justify-content: space-between;
+      padding: 0.2rem 0;
+      border-bottom: 1px dashed rgba(255, 255, 255, 0.05);
+    }
+
+    .metric-line:last-child {
+      border-bottom: none;
+    }
+
+    .metric-name {
+      color: var(--accent-blue);
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="header-title">
+      <div class="badge-icon">⚡</div>
+      <div>
+        <h1>Raft Consensus KV Cluster</h1>
+        <div class="subtitle">Distributed Key-Value Store & Consensus State Inspector</div>
+      </div>
+    </div>
+    <div class="live-indicator">
+      <div class="pulse-dot"></div>
+      Cluster Active & Syncing (3 Nodes)
+    </div>
+  </div>
+
+  <div class="dashboard-grid" id="nodes-grid">
+    <!-- Node 1 -->
+    <div class="node-card" id="card-node1">
+      <div class="node-header">
+        <div class="node-id">node1</div>
+        <div class="role-badge" id="badge-node1">...</div>
+      </div>
+      <div class="metrics-row">
+        <div class="metric-box">
+          <div class="metric-label">Current Term</div>
+          <div class="metric-value" id="term-node1">-</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">Commit Index</div>
+          <div class="metric-value" id="commit-node1">-</div>
+        </div>
+      </div>
+      <div class="metrics-row">
+        <div class="metric-box">
+          <div class="metric-label">Log Length</div>
+          <div class="metric-value" id="log-node1">-</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">Voted For</div>
+          <div class="metric-value" id="voted-node1">-</div>
+        </div>
+      </div>
+      <div style="font-size:0.8rem; color:var(--text-muted); text-align:right;">HTTP: :8001 | gRPC: :9001</div>
+    </div>
+
+    <!-- Node 2 -->
+    <div class="node-card" id="card-node2">
+      <div class="node-header">
+        <div class="node-id">node2</div>
+        <div class="role-badge" id="badge-node2">...</div>
+      </div>
+      <div class="metrics-row">
+        <div class="metric-box">
+          <div class="metric-label">Current Term</div>
+          <div class="metric-value" id="term-node2">-</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">Commit Index</div>
+          <div class="metric-value" id="commit-node2">-</div>
+        </div>
+      </div>
+      <div class="metrics-row">
+        <div class="metric-box">
+          <div class="metric-label">Log Length</div>
+          <div class="metric-value" id="log-node2">-</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">Voted For</div>
+          <div class="metric-value" id="voted-node2">-</div>
+        </div>
+      </div>
+      <div style="font-size:0.8rem; color:var(--text-muted); text-align:right;">HTTP: :8002 | gRPC: :9002</div>
+    </div>
+
+    <!-- Node 3 -->
+    <div class="node-card" id="card-node3">
+      <div class="node-header">
+        <div class="node-id">node3</div>
+        <div class="role-badge" id="badge-node3">...</div>
+      </div>
+      <div class="metrics-row">
+        <div class="metric-box">
+          <div class="metric-label">Current Term</div>
+          <div class="metric-value" id="term-node3">-</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">Commit Index</div>
+          <div class="metric-value" id="commit-node3">-</div>
+        </div>
+      </div>
+      <div class="metrics-row">
+        <div class="metric-box">
+          <div class="metric-label">Log Length</div>
+          <div class="metric-value" id="log-node3">-</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-label">Voted For</div>
+          <div class="metric-value" id="voted-node3">-</div>
+        </div>
+      </div>
+      <div style="font-size:0.8rem; color:var(--text-muted); text-align:right;">HTTP: :8003 | gRPC: :9003</div>
+    </div>
+  </div>
+
+  <div class="sections-grid">
+    <!-- Key Value Console Panel -->
+    <div class="panel">
+      <div class="panel-title">🔑 Interactive KV Storage Console</div>
+      <div class="form-group">
+        <label>Key Name</label>
+        <input type="text" id="kv-key" value="demo-key" placeholder="Enter key name...">
+      </div>
+      <div class="form-group">
+        <label>Value Payload</label>
+        <input type="text" id="kv-value" value="Hello Raft Consensus!" placeholder="Enter value payload...">
+      </div>
+      <div class="btn-group">
+        <button class="btn-primary" onclick="executePut()">PUT (Write Key)</button>
+        <button class="btn-secondary" onclick="executeGet()">GET (Read Key)</button>
+      </div>
+      <div class="result-console" id="kv-result">Console Ready. Click GET or PUT to operate on the consensus state machine...</div>
+    </div>
+
+    <!-- Prometheus Live Metrics Panel -->
+    <div class="panel">
+      <div class="panel-title">📊 Live Prometheus Metrics (/metrics)</div>
+      <div class="metrics-stream" id="metrics-box">
+        Loading real-time consensus gauges...
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const ports = {
+      node1: 8001,
+      node2: 8002,
+      node3: 8003
+    };
+
+    let leaderPort = 8001;
+
+    async function pollClusterState() {
+      for (const [nodeId, port] of Object.entries(ports)) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/status`);
+          if (!res.ok) continue;
+          const data = await res.json();
+
+          const card = document.getElementById(`card-${nodeId}`);
+          const badge = document.getElementById(`badge-${nodeId}`);
+          const term = document.getElementById(`term-${nodeId}`);
+          const commit = document.getElementById(`commit-${nodeId}`);
+          const log = document.getElementById(`log-${nodeId}`);
+          const voted = document.getElementById(`voted-${nodeId}`);
+
+          term.textContent = data.current_term ?? '-';
+          commit.textContent = data.commit_index ?? '-';
+          log.textContent = data.log_length ?? '-';
+          voted.textContent = data.voted_for ?? 'none';
+
+          if (data.role === 'leader') {
+            leaderPort = port;
+            card.className = 'node-card leader';
+            badge.className = 'role-badge leader';
+            badge.textContent = '★ Leader';
+          } else {
+            card.className = 'node-card follower';
+            badge.className = 'role-badge follower';
+            badge.textContent = 'Follower';
+          }
+        } catch (e) {
+          console.error(`Error polling ${nodeId}`, e);
+        }
+      }
+
+      // Poll metrics from leader
+      try {
+        const mRes = await fetch(`http://127.0.0.1:${leaderPort}/metrics`);
+        if (mRes.ok) {
+          const mText = await mRes.text();
+          const lines = mText.split('\n').filter(l => l && !l.startsWith('#'));
+          const box = document.getElementById('metrics-box');
+          box.innerHTML = lines.map(line => {
+            const parts = line.split(' ');
+            if (parts.length >= 2) {
+              return `<div class="metric-line"><span class="metric-name">${parts[0]}</span><span>${parts[1]}</span></div>`;
+            }
+            return '';
+          }).join('');
+        }
+      } catch (e) {}
+    }
+
+    async function executePut() {
+      const key = document.getElementById('kv-key').value;
+      const value = document.getElementById('kv-value').value;
+      const resultBox = document.getElementById('kv-result');
+
+      resultBox.textContent = `Sending PUT to Leader (Port ${leaderPort})...`;
+      try {
+        const res = await fetch(`http://127.0.0.1:${leaderPort}/kv/${key}`, {
+          method: 'PUT',
+          headers: {
+            'X-Client-ID': 'web-dashboard',
+            'X-Request-ID': Date.now().toString()
+          },
+          body: value
+        });
+        const text = await res.text();
+        resultBox.textContent = `[HTTP ${res.status}] ${text}`;
+        pollClusterState();
+      } catch (e) {
+        resultBox.textContent = `Error: ${e.message}`;
+      }
+    }
+
+    async function executeGet() {
+      const key = document.getElementById('kv-key').value;
+      const resultBox = document.getElementById('kv-result');
+
+      resultBox.textContent = `Sending ReadIndex GET to Leader (Port ${leaderPort})...`;
+      try {
+        const res = await fetch(`http://127.0.0.1:${leaderPort}/kv/${key}`);
+        const text = await res.text();
+        resultBox.textContent = `[HTTP ${res.status}] ${text}`;
+      } catch (e) {
+        resultBox.textContent = `Error: ${e.message}`;
+      }
+    }
+
+    pollClusterState();
+    setInterval(pollClusterState, 2000);
+  </script>
+</body>
+</html>

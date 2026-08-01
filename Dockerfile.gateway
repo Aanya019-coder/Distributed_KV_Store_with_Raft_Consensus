@@ -1,0 +1,30 @@
+# Stage 1: Build Frontend React App
+FROM node:20-alpine AS frontend-builder
+WORKDIR /app/frontend
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# Stage 2: Build Gateway Go Binary
+FROM golang:1.22-alpine AS gateway-builder
+RUN apk add --no-cache git ca-certificates
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /out/gateway ./cmd/gateway
+
+# Stage 3: Final Gateway Container
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates curl
+RUN addgroup -g 1000 raft && adduser -u 1000 -S -G raft raft
+
+WORKDIR /app
+COPY --from=gateway-builder /out/gateway /app/gateway
+COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
+
+USER raft
+EXPOSE 7000
+
+ENTRYPOINT ["/app/gateway", "-http-addr", ":7000", "-frontend-dir", "/app/frontend/dist"]

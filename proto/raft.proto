@@ -6,6 +6,7 @@ option go_package = "raft-kv/proto;raftproto";
 
 service RaftService {
   rpc RequestVote (RequestVoteRequest) returns (RequestVoteResponse);
+  rpc PreVote (RequestVoteRequest) returns (RequestVoteResponse);
   rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
   rpc InstallSnapshot (InstallSnapshotRequest) returns (InstallSnapshotResponse);
 }

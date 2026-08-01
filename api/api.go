@@ -183,10 +183,52 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		s.handlePut(w, r, key)
 	case http.MethodDelete:
-		s.handleDelete(w, key)
+		s.handleDelete(w, r, key)
 	default:
 		http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
 	}
+}
+
+func extractClientMetadata(r *http.Request, body []byte) (clientID string, requestID int64, value string) {
+	clientID = r.Header.Get("X-Client-ID")
+	if reqIDStr := r.Header.Get("X-Request-ID"); reqIDStr != "" {
+		fmt.Sscanf(reqIDStr, "%d", &requestID)
+	}
+
+	if clientID == "" {
+		clientID = r.URL.Query().Get("client_id")
+	}
+	if requestID == 0 {
+		if reqIDStr := r.URL.Query().Get("request_id"); reqIDStr != "" {
+			fmt.Sscanf(reqIDStr, "%d", &requestID)
+		}
+	}
+
+	value = string(body)
+	if len(body) > 0 {
+		var jsonPayload struct {
+			ClientID  string `json:"client_id"`
+			RequestID int64  `json:"request_id"`
+			Value     string `json:"value"`
+			Val       string `json:"val"`
+		}
+		if err := json.Unmarshal(body, &jsonPayload); err == nil {
+			if jsonPayload.ClientID != "" {
+				clientID = jsonPayload.ClientID
+			}
+			if jsonPayload.RequestID > 0 {
+				requestID = jsonPayload.RequestID
+			}
+			if jsonPayload.Value != "" || jsonPayload.Val != "" {
+				if jsonPayload.Value != "" {
+					value = jsonPayload.Value
+				} else {
+					value = jsonPayload.Val
+				}
+			}
+		}
+	}
+	return clientID, requestID, value
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, key string) {
@@ -232,10 +274,10 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 		return
 	}
 
-	val := string(body)
+	clientID, requestID, val := extractClientMetadata(r, body)
 	s.logSanitized("PUT", key, len(val))
 
-	ok, err := s.raft.Propose("PUT", key, val)
+	ok, err := s.raft.ProposeWithClient("PUT", key, val, clientID, requestID)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error": "%s"}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -252,16 +294,19 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request, key string) {
 	success = true
 }
 
-func (s *Server) handleDelete(w http.ResponseWriter, key string) {
+func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, key string) {
 	start := time.Now()
 	success := false
 	defer func() {
 		raft.RecordRequestMetrics("DELETE", start, success)
 	}()
 
+	body, _ := io.ReadAll(io.LimitReader(r.Body, MaxValueSize+1))
+	clientID, requestID, _ := extractClientMetadata(r, body)
+
 	s.logSanitized("DELETE", key, 0)
 
-	ok, err := s.raft.Propose("DEL", key, "")
+	ok, err := s.raft.ProposeWithClient("DEL", key, "", clientID, requestID)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error": "%s"}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -501,6 +546,13 @@ func (s *Server) logSanitized(op, key string, size int) {
 
 func (s *Server) recoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Client-ID, X-Request-ID")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		defer func() {
 			if err := recover(); err != nil {
 				fmt.Printf("[ERROR] Recovered from HTTP handler panic: %v\n", err)

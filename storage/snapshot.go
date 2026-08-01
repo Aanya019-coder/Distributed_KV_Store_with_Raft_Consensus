@@ -17,12 +17,20 @@ type ClusterConfigSnapshot struct {
 	Joint    bool              `json:"joint"`
 }
 
+// DedupEntry stores the last applied request ID and cached response per client for deduplication.
+type DedupEntry struct {
+	LastAppliedRequestID int64  `json:"last_applied_request_id"`
+	Response             string `json:"response"`
+	Status               string `json:"status"`
+}
+
 // Snapshot represents a point-in-time state of the key-value store and the consensus metadata.
 type Snapshot struct {
 	LastIncludedIndex int64                  `json:"last_included_index"`
 	LastIncludedTerm  int64                  `json:"last_included_term"`
 	KVState           map[string]string      `json:"kv_state"`
 	ClusterConfig     *ClusterConfigSnapshot `json:"cluster_config,omitempty"`
+	DedupTable        map[string]DedupEntry  `json:"dedup_table,omitempty"`
 }
 
 // SaveSnapshot writes the snapshot data atomically to disk with 0600 permissions.

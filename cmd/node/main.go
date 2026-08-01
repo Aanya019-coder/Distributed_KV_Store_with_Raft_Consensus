@@ -31,6 +31,7 @@ func main() {
 	adminToken := flag.String("admin-token", "", "Bearer token for admin operations (falls back to api-token / KV_API_TOKEN)")
 	allowUnauthReads := flag.Bool("allow-unauth-reads", false, "Allow unauthenticated GET reads")
 	snapshotThreshold := flag.Int("snapshot-threshold", 1000, "Compacted log threshold for snapshotting")
+	readSafety := flag.String("read-safety", "safe", "Read safety policy: safe (ReadIndex majority quorum check), lease (bounded leader lease), or local (unverified local state)")
 	debug := flag.Bool("debug", false, "Enable debug verbose logging")
 	flag.Parse()
 
@@ -103,6 +104,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("[ERROR] Failed to initialize Raft: %v", err)
 	}
+	r.SetReadSafety(*readSafety)
 
 	// Initialize cluster configuration from startup peers
 	r.InitClusterConfig(peers, peerHTTPAddrs)

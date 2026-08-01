@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: raft_toxiproxy
+    ports:
+      - "8474:8474"
+      - "9101:9101"
+      - "9102:9102"
+      - "9103:9103"
+    networks:
+      - raft-chaos-net
+
+  node1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raft_chaos_node1
+    environment:
+      - KV_API_TOKEN=mysecrettoken
+      - KV_ADMIN_TOKEN=myadmintoken
+    command: ["-id", "node1", "-grpc-addr", "0.0.0.0:9001", "-http-addr", "0.0.0.0:8001", "-peers", "node2=toxiproxy:9102,node3=toxiproxy:9103", "-storage-dir", "/data/node1", "-read-safety", "safe"]
+    ports:
+      - "8001:8001"
+    networks:
+      - raft-chaos-net
+
+  node2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raft_chaos_node2
+    environment:
+      - KV_API_TOKEN=mysecrettoken
+      - KV_ADMIN_TOKEN=myadmintoken
+    command: ["-id", "node2", "-grpc-addr", "0.0.0.0:9002", "-http-addr", "0.0.0.0:8002", "-peers", "node1=toxiproxy:9101,node3=toxiproxy:9103", "-storage-dir", "/data/node2", "-read-safety", "safe"]
+    ports:
+      - "8002:8002"
+    networks:
+      - raft-chaos-net
+
+  node3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raft_chaos_node3
+    environment:
+      - KV_API_TOKEN=mysecrettoken
+      - KV_ADMIN_TOKEN=myadmintoken
+    command: ["-id", "node3", "-grpc-addr", "0.0.0.0:9003", "-http-addr", "0.0.0.0:8003", "-peers", "node1=toxiproxy:9101,node2=toxiproxy:9102", "-storage-dir", "/data/node3", "-read-safety", "safe"]
+    ports:
+      - "8003:8003"
+    networks:
+      - raft-chaos-net
+
+networks:
+  raft-chaos-net:
+    driver: bridge

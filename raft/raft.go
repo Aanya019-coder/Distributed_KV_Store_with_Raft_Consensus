@@ -45,9 +45,11 @@ func (s RaftState) String() string {
 
 // Command is the operation applied to the KV store.
 type Command struct {
-	Op  string `json:"op"`
-	Key string `json:"key"`
-	Val string `json:"val"`
+	Op        string `json:"op"`
+	Key       string `json:"key"`
+	Val       string `json:"val"`
+	ClientID  string `json:"client_id,omitempty"`
+	RequestID int64  `json:"request_id,omitempty"`
 }
 
 type rpcReq struct {
@@ -66,6 +68,16 @@ type cmdResp struct {
 }
 
 type voteRespMsg struct {
+	peerID string
+	resp   *raftproto.RequestVoteResponse
+}
+
+type preVoteReqMsg struct {
+	req  *raftproto.RequestVoteRequest
+	resp chan interface{}
+}
+
+type preVoteRespMsg struct {
 	peerID string
 	resp   *raftproto.RequestVoteResponse
 }
@@ -134,6 +146,7 @@ type Raft struct {
 	wal          *storage.WAL
 	snapshotPath string
 	kv           map[string]string
+	dedupTable   map[string]storage.DedupEntry
 	snapshotBuf  []byte
 
 	// Cluster configuration (joint consensus)
@@ -151,10 +164,14 @@ type Raft struct {
 	peerServerName string
 
 	// Options/Fault simulation
-	debug             bool
-	snapshotThreshold int
-	partition         map[string]bool
-	networkDelay      time.Duration
+	readSafety           string // "safe", "lease", "local"
+	lastHeartbeatQuorum  time.Time
+	lastLeaderHeartbeat  time.Time
+	preVoteVotesReceived map[string]bool
+	debug                bool
+	snapshotThreshold    int
+	partition            map[string]bool
+	networkDelay         time.Duration
 }
 
 // NewRaft initializes a new Raft node.
@@ -177,7 +194,8 @@ func NewRaft(
 		peers:             peers,
 		grpcPeers:         make(map[string]*peerClient),
 		state:             Follower,
-		votesReceived:     make(map[string]bool),
+		votesReceived:        make(map[string]bool),
+		preVoteVotesReceived: make(map[string]bool),
 		nextIndex:         make(map[string]int64),
 		matchIndex:        make(map[string]int64),
 		rpcCh:             make(chan rpcReq, 100),
@@ -189,12 +207,14 @@ func NewRaft(
 		wal:               wal,
 		snapshotPath:      fmt.Sprintf("%s/snapshot.json", storageDir),
 		kv:                make(map[string]string),
+		dedupTable:        make(map[string]storage.DedupEntry),
 		peerHTTPAddrs:     make(map[string]string),
 		currentConfig:     ConfigFromPeers(peers, nil, id),
 		caCertPath:        caCertPath,
 		nodeCertPath:      nodeCertPath,
 		nodeKeyPath:       nodeKeyPath,
 		peerServerName:    peerServerName,
+		readSafety:        "safe",
 		debug:             debug,
 		snapshotThreshold: snapshotThreshold,
 		proposalTime:      make(map[int64]time.Time),
@@ -260,7 +280,12 @@ func (r *Raft) Stop() {
 
 // Propose appends a client request to the replicated log.
 func (r *Raft) Propose(op, key, val string) (bool, error) {
-	cmd := Command{Op: op, Key: key, Val: val}
+	return r.ProposeWithClient(op, key, val, "", 0)
+}
+
+// ProposeWithClient appends a client request with deduplication metadata to the replicated log.
+func (r *Raft) ProposeWithClient(op, key, val, clientID string, requestID int64) (bool, error) {
+	cmd := Command{Op: op, Key: key, Val: val, ClientID: clientID, RequestID: requestID}
 	data, err := json.Marshal(cmd)
 	if err != nil {
 		return false, err
@@ -296,11 +321,157 @@ func (r *Raft) ProposeConfigChange(req ConfigChangeRequest) (bool, error) {
 	return res.success, res.err
 }
 
-// Get reads from the local state machine (leader-only).
-func (r *Raft) Get(key string) (string, bool, bool) {
+// SetReadSafety configures the read safety mode ("safe", "lease", "local").
+func (r *Raft) SetReadSafety(mode string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.readSafety = mode
+}
+
+func (r *Raft) confirmLeaderQuorum(term int64) bool {
+	r.mu.Lock()
+	if r.state != Leader || r.currentTerm != term {
+		r.mu.Unlock()
+		return false
+	}
+	allPeers := r.effectivePeers()
+	if len(allPeers) == 0 {
+		r.lastHeartbeatQuorum = time.Now()
+		r.mu.Unlock()
+		return true
+	}
+
+	prevLogIdx := r.lastLogIndex()
+	prevLogTerm := r.lastLogTerm()
+	leaderCommit := r.commitIndex
+	currentConfig := r.currentConfig
+	r.mu.Unlock()
+
+	type res struct {
+		peerID  string
+		success bool
+	}
+	resCh := make(chan res, len(allPeers))
+
+	for peerID := range allPeers {
+		go func(pid string) {
+			resp, err := r.sendAppendEntries(pid, term, prevLogIdx, prevLogTerm, nil, leaderCommit)
+			if err == nil && resp != nil && resp.Success {
+				resCh <- res{peerID: pid, success: true}
+			} else {
+				resCh <- res{peerID: pid, success: false}
+			}
+		}(peerID)
+	}
+
+	ackMap := make(map[string]bool)
+	ackMap[r.id] = true // self vote
+
+	timer := time.NewTimer(500 * time.Millisecond)
+	defer timer.Stop()
+
+	for i := 0; i < len(allPeers); i++ {
+		select {
+		case rMsg := <-resCh:
+			if rMsg.success {
+				ackMap[rMsg.peerID] = true
+			}
+		case <-timer.C:
+			break
+		}
+
+		if currentConfig != nil {
+			if currentConfig.HasMajority(r.id, ackMap) {
+				r.mu.Lock()
+				r.lastHeartbeatQuorum = time.Now()
+				r.mu.Unlock()
+				return true
+			}
+		} else {
+			if len(ackMap) >= (len(allPeers)+1)/2+1 {
+				r.mu.Lock()
+				r.lastHeartbeatQuorum = time.Now()
+				r.mu.Unlock()
+				return true
+			}
+		}
+	}
+
+	if currentConfig != nil {
+		hasMaj := currentConfig.HasMajority(r.id, ackMap)
+		if hasMaj {
+			r.mu.Lock()
+			r.lastHeartbeatQuorum = time.Now()
+			r.mu.Unlock()
+		}
+		return hasMaj
+	}
+
+	hasMaj := len(ackMap) >= (len(allPeers)+1)/2+1
+	if hasMaj {
+		r.mu.Lock()
+		r.lastHeartbeatQuorum = time.Now()
+		r.mu.Unlock()
+	}
+	return hasMaj
+}
+
+func (r *Raft) waitForAppliedIndex(readIndex int64, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		applied := r.lastApplied
+		r.mu.Unlock()
+		if applied >= readIndex {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+// Get reads from the local state machine according to the configured read safety policy.
+func (r *Raft) Get(key string) (string, bool, bool) {
+	r.mu.Lock()
 	if r.state != Leader {
+		r.mu.Unlock()
+		return "", false, false
+	}
+	mode := r.readSafety
+	if mode == "" {
+		mode = "safe"
+	}
+
+	if mode == "local" {
+		val, ok := r.kv[key]
+		r.mu.Unlock()
+		return val, ok, true
+	}
+
+	if mode == "lease" {
+		if time.Since(r.lastHeartbeatQuorum) < 250*time.Millisecond {
+			val, ok := r.kv[key]
+			r.mu.Unlock()
+			return val, ok, true
+		}
+	}
+
+	// Safe mode: ReadIndex quorum check
+	readIndex := r.commitIndex
+	term := r.currentTerm
+	r.mu.Unlock()
+
+	if !r.confirmLeaderQuorum(term) {
+		return "", false, false
+	}
+
+	if !r.waitForAppliedIndex(readIndex, 2*time.Second) {
+		return "", false, false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state != Leader || r.currentTerm != term {
 		return "", false, false
 	}
 	val, ok := r.kv[key]
@@ -428,7 +599,7 @@ func (r *Raft) run() {
 		case <-r.electionTimer.C:
 			r.mu.Lock()
 			if (r.state == Follower || r.state == Candidate) && !r.isJoining {
-				r.transitionToCandidate()
+				r.startPreVote()
 			} else if r.isJoining {
 				r.resetElectionTimer()
 			}
@@ -482,6 +653,44 @@ func (r *Raft) transitionToFollower(term int64) {
 		p.respCh <- cmdResp{success: false, err: errors.New("node transitioned to follower")}
 	}
 	r.proposals = nil
+}
+
+func (r *Raft) startPreVote() {
+	r.resetElectionTimer()
+	r.preVoteVotesReceived = make(map[string]bool)
+	r.preVoteVotesReceived[r.id] = true
+
+	targetTerm := r.currentTerm + 1
+	lastLogIdx := r.lastLogIndex()
+	lastLogTerm := r.lastLogTerm()
+
+	allPeers := r.effectivePeers()
+	r.logInfo("Initiating Pre-Vote phase for target term %d", targetTerm)
+
+	if len(allPeers) == 0 {
+		r.transitionToCandidate()
+		return
+	}
+
+	for peerID, peerAddr := range allPeers {
+		go func(pid, addr string) {
+			resp, err := r.sendPreVote(pid, targetTerm, lastLogIdx, lastLogTerm)
+			if err != nil {
+				r.logDebug("Failed to send PreVote to %s: %v", pid, err)
+				return
+			}
+			msg := &preVoteRespMsg{peerID: pid, resp: resp}
+			select {
+			case r.rpcCh <- rpcReq{req: msg}:
+			case <-r.shutdown:
+				return
+			default:
+				r.mu.Lock()
+				r.processPreVoteResponse(msg)
+				r.mu.Unlock()
+			}
+		}(peerID, peerAddr)
+	}
 }
 
 func (r *Raft) transitionToCandidate() {
@@ -747,6 +956,11 @@ func (r *Raft) sendSnapshotToPeer(peerID string) {
 
 func (r *Raft) handleRPC(msg rpcReq) {
 	switch m := msg.req.(type) {
+	case preVoteReqMsg:
+		resp := r.processPreVote(m.req)
+		if msg.resp != nil {
+			msg.resp <- resp
+		}
 	case *raftproto.RequestVoteRequest:
 		resp := r.processRequestVote(m)
 		if msg.resp != nil {
@@ -762,12 +976,60 @@ func (r *Raft) handleRPC(msg rpcReq) {
 		if msg.resp != nil {
 			msg.resp <- resp
 		}
+	case *preVoteRespMsg:
+		r.processPreVoteResponse(m)
 	case *voteRespMsg:
 		r.processRequestVoteResponse(m)
 	case *appendRespMsg:
 		r.processAppendEntriesResponse(m)
 	case *snapshotRespMsg:
 		r.processInstallSnapshotResponse(m)
+	}
+}
+
+func (r *Raft) processPreVote(req *raftproto.RequestVoteRequest) *raftproto.RequestVoteResponse {
+	if req.Term <= r.currentTerm {
+		return &raftproto.RequestVoteResponse{Term: r.currentTerm, VoteGranted: false}
+	}
+
+	if r.currentConfig != nil && !r.currentConfig.ContainsNode(req.CandidateId) {
+		r.logInfo("Ignoring PreVote from %s: candidate not in cluster configuration", req.CandidateId)
+		return &raftproto.RequestVoteResponse{Term: r.currentTerm, VoteGranted: false}
+	}
+
+	if r.state == Follower && !r.lastLeaderHeartbeat.IsZero() && time.Since(r.lastLeaderHeartbeat) < 300*time.Millisecond {
+		r.logDebug("Rejecting PreVote from %s: active leader lease detected", req.CandidateId)
+		return &raftproto.RequestVoteResponse{Term: r.currentTerm, VoteGranted: false}
+	}
+
+	lastTerm := r.lastLogTerm()
+	lastIdx := r.lastLogIndex()
+	logOK := req.LastLogTerm > lastTerm || (req.LastLogTerm == lastTerm && req.LastLogIndex >= lastIdx)
+
+	if logOK {
+		r.logInfo("PreVote granted to %s for term %d", req.CandidateId, req.Term)
+		return &raftproto.RequestVoteResponse{Term: req.Term, VoteGranted: true}
+	}
+
+	return &raftproto.RequestVoteResponse{Term: r.currentTerm, VoteGranted: false}
+}
+
+func (r *Raft) processPreVoteResponse(msg *preVoteRespMsg) {
+	if (r.state == Follower || r.state == Candidate) && msg.resp.VoteGranted {
+		r.preVoteVotesReceived[msg.peerID] = true
+
+		hasMaj := false
+		if r.currentConfig != nil {
+			hasMaj = r.currentConfig.HasMajority(r.id, r.preVoteVotesReceived)
+		} else {
+			majority := (len(r.peers)+1)/2 + 1
+			hasMaj = len(r.preVoteVotesReceived) >= majority
+		}
+
+		if hasMaj {
+			r.logInfo("Pre-Vote succeeded with majority! Transitioning to Candidate")
+			r.transitionToCandidate()
+		}
 	}
 }
 
@@ -1315,13 +1577,34 @@ func (r *Raft) applyCommand(cmdBytes []byte) {
 		return
 	}
 
+	if cmd.ClientID != "" && cmd.RequestID > 0 {
+		if prev, ok := r.dedupTable[cmd.ClientID]; ok && cmd.RequestID <= prev.LastAppliedRequestID {
+			r.logInfo("Skipping re-application of duplicate request client=%s reqID=%d", cmd.ClientID, cmd.RequestID)
+			return
+		}
+	}
+
 	switch cmd.Op {
 	case "PUT":
 		r.kv[cmd.Key] = cmd.Val
 		r.logInfo("Applied PUT for key: %s (size: %d bytes)", cmd.Key, len(cmd.Val))
+		if cmd.ClientID != "" && cmd.RequestID > 0 {
+			r.dedupTable[cmd.ClientID] = storage.DedupEntry{
+				LastAppliedRequestID: cmd.RequestID,
+				Response:             "ok",
+				Status:               "ok",
+			}
+		}
 	case "DEL":
 		delete(r.kv, cmd.Key)
 		r.logInfo("Applied DEL for key: %s", cmd.Key)
+		if cmd.ClientID != "" && cmd.RequestID > 0 {
+			r.dedupTable[cmd.ClientID] = storage.DedupEntry{
+				LastAppliedRequestID: cmd.RequestID,
+				Response:             "ok",
+				Status:               "ok",
+			}
+		}
 	}
 }
 
@@ -1333,10 +1616,16 @@ func (r *Raft) takeSnapshot() {
 		kvCopy[k] = v
 	}
 
+	dedupCopy := make(map[string]storage.DedupEntry)
+	for k, v := range r.dedupTable {
+		dedupCopy[k] = v
+	}
+
 	snap := &storage.Snapshot{
 		LastIncludedIndex: r.commitIndex,
 		LastIncludedTerm:  r.getEntryTerm(r.commitIndex),
 		KVState:           kvCopy,
+		DedupTable:        dedupCopy,
 	}
 
 	// Persist cluster config in snapshot
@@ -1357,7 +1646,10 @@ func (r *Raft) takeSnapshot() {
 
 	var newLog []*raftproto.LogEntry
 	for i := r.commitIndex + 1; i <= r.lastLogIndex(); i++ {
-		newLog = append(newLog, r.getEntry(i))
+		e := r.getEntry(i)
+		if e != nil {
+			newLog = append(newLog, e)
+		}
 	}
 
 	r.lastIncludedIndex = snap.LastIncludedIndex
@@ -1384,6 +1676,13 @@ func (r *Raft) restoreSnapshot(snap *storage.Snapshot) {
 	r.kv = make(map[string]string)
 	for k, v := range snap.KVState {
 		r.kv[k] = v
+	}
+
+	r.dedupTable = make(map[string]storage.DedupEntry)
+	if snap.DedupTable != nil {
+		for k, v := range snap.DedupTable {
+			r.dedupTable[k] = v
+		}
 	}
 
 	// Restore cluster config from snapshot
@@ -1435,6 +1734,12 @@ func (r *Raft) loadState() error {
 
 	if snap != nil {
 		r.kv = snap.KVState
+		r.dedupTable = make(map[string]storage.DedupEntry)
+		if snap.DedupTable != nil {
+			for k, v := range snap.DedupTable {
+				r.dedupTable[k] = v
+			}
+		}
 		r.lastIncludedIndex = snap.LastIncludedIndex
 		r.lastIncludedTerm = snap.LastIncludedTerm
 		r.commitIndex = snap.LastIncludedIndex
@@ -1481,17 +1786,21 @@ func (r *Raft) loadState() error {
 // --- Helpers and Index Translation ---
 
 func (r *Raft) lastLogIndex() int64 {
-	if len(r.log) == 0 {
-		return r.lastIncludedIndex
+	for i := len(r.log) - 1; i >= 0; i-- {
+		if r.log[i] != nil {
+			return r.log[i].Index
+		}
 	}
-	return r.log[len(r.log)-1].Index
+	return r.lastIncludedIndex
 }
 
 func (r *Raft) lastLogTerm() int64 {
-	if len(r.log) == 0 {
-		return r.lastIncludedTerm
+	for i := len(r.log) - 1; i >= 0; i-- {
+		if r.log[i] != nil {
+			return r.log[i].Term
+		}
 	}
-	return r.log[len(r.log)-1].Term
+	return r.lastIncludedTerm
 }
 
 func (r *Raft) getEntry(idx int64) *raftproto.LogEntry {
@@ -1535,6 +1844,30 @@ func (r *Raft) checkNetworkFault(peerID string) error {
 		return status.Errorf(codes.Unavailable, "simulated network partition for peer %s", peerID)
 	}
 	return nil
+}
+
+func (r *Raft) sendPreVote(peerID string, term, lastLogIdx, lastLogTerm int64) (*raftproto.RequestVoteResponse, error) {
+	if err := r.checkNetworkFault(peerID); err != nil {
+		return nil, err
+	}
+
+	r.mu.Lock()
+	pc, ok := r.grpcPeers[peerID]
+	r.mu.Unlock()
+
+	if !ok {
+		return nil, errors.New("gRPC client connection not found")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	return pc.cli.PreVote(ctx, &raftproto.RequestVoteRequest{
+		Term:         term,
+		CandidateId:  r.id,
+		LastLogIndex: lastLogIdx,
+		LastLogTerm:  lastLogTerm,
+	})
 }
 
 func (r *Raft) sendRequestVote(peerID string, term, lastLogIdx, lastLogTerm int64) (*raftproto.RequestVoteResponse, error) {
@@ -1646,6 +1979,27 @@ func (r *Raft) connectToPeers() error {
 }
 
 // --- gRPC Server Implementations ---
+
+func (r *Raft) PreVote(ctx context.Context, req *raftproto.RequestVoteRequest) (*raftproto.RequestVoteResponse, error) {
+	respCh := make(chan interface{}, 1)
+	msg := preVoteReqMsg{req: req, resp: respCh}
+	select {
+	case r.rpcCh <- rpcReq{req: msg, resp: respCh}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-r.shutdown:
+		return nil, status.Errorf(codes.Unavailable, "node is shutting down")
+	}
+
+	select {
+	case res := <-respCh:
+		return res.(*raftproto.RequestVoteResponse), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-r.shutdown:
+		return nil, status.Errorf(codes.Unavailable, "node is shutting down")
+	}
+}
 
 func (r *Raft) RequestVote(ctx context.Context, req *raftproto.RequestVoteRequest) (*raftproto.RequestVoteResponse, error) {
 	respCh := make(chan interface{}, 1)
