@@ -12,7 +12,8 @@ A production-grade, from-scratch implementation of the Raft Consensus Algorithm 
 - **mTLS Security**, **WAL & Snapshot Durability**, and zero-dependency **Prometheus & Grafana observability**.
 
 > [!TIP]
-> **Live Deployed Instance**: [`https://raft-kv-node1.onrender.com`](https://raft-kv-node1.onrender.com)
+> 🌐 **Live Web Dashboard**: [`https://distributed-kv-store-with-raft-cons.vercel.app`](https://distributed-kv-store-with-raft-cons.vercel.app/)
+> ⚡ **Live Backend API (Render)**: [`https://raft-kv-node1.onrender.com`](https://raft-kv-node1.onrender.com)
 > - **Live Cluster Status**: [`https://raft-kv-node1.onrender.com/status`](https://raft-kv-node1.onrender.com/status)
 > - **Live Prometheus Metrics**: [`https://raft-kv-node1.onrender.com/metrics`](https://raft-kv-node1.onrender.com/metrics)
 > - **Live Health Check**: [`https://raft-kv-node1.onrender.com/healthz`](https://raft-kv-node1.onrender.com/healthz)
