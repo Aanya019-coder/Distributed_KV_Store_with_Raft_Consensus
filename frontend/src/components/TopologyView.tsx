@@ -5,11 +5,37 @@ interface TopologyViewProps {
   connected: boolean
 }
 
-const NODE_POSITIONS = [
-  { x: 250, y: 80 },
-  { x: 80,  y: 320 },
-  { x: 420, y: 320 },
-]
+function getNodePositions(count: number): { x: number; y: number }[] {
+  if (count <= 1) {
+    return [{ x: 250, y: 200 }]
+  }
+  if (count === 2) {
+    return [
+      { x: 150, y: 200 },
+      { x: 350, y: 200 },
+    ]
+  }
+  if (count === 3) {
+    return [
+      { x: 250, y: 100 },
+      { x: 100, y: 300 },
+      { x: 400, y: 300 },
+    ]
+  }
+  // Circle layout for > 3 nodes
+  const positions: { x: number; y: number }[] = []
+  const cx = 250
+  const cy = 210
+  const radius = 130
+  for (let i = 0; i < count; i++) {
+    const angle = (i * 2 * Math.PI) / count - Math.PI / 2
+    positions.push({
+      x: Math.round(cx + radius * Math.cos(angle)),
+      y: Math.round(cy + radius * Math.sin(angle)),
+    })
+  }
+  return positions
+}
 
 function roleColor(role: NodeStatus['role'] | undefined) {
   if (role === 'leader') return '#10b981'
@@ -25,15 +51,16 @@ function roleBadge(role: NodeStatus['role'] | undefined, offline?: boolean) {
 }
 
 export function TopologyView({ overview, connected }: TopologyViewProps) {
-  const nodeCount = overview?.nodes.length ?? 3
-  const positions = NODE_POSITIONS.slice(0, Math.max(nodeCount, 3))
+  const nodes = overview?.nodes ?? []
+  const displayNodes = nodes.length > 0 ? nodes : [{ node_id: 'node1', role: 'follower' as const, current_term: 0, commit_index: 0, last_applied: 0, log_length: 0, voted_for: '', cluster_members: ['node1'], cluster_size: 1, joint_consensus: false, pending_config_change: false }]
+  const positions = getNodePositions(displayNodes.length)
 
   return (
     <div className="topology-wrapper">
       <div className="topology-header">
         <h2>Cluster Topology</h2>
         <span className={`conn-badge ${connected ? 'conn-live' : 'conn-disconnected'}`}>
-          {connected ? '● Live' : '○ Reconnecting...'}
+          {connected ? '● Live' : '○ Connecting...'}
         </span>
       </div>
 
@@ -43,36 +70,38 @@ export function TopologyView({ overview, connected }: TopologyViewProps) {
           {overview.nodes[0] && (
             <span>Term: <strong>{overview.nodes[0].current_term}</strong></span>
           )}
+          <span>Active Nodes: <strong>{overview.nodes.length}</strong></span>
         </div>
       )}
 
       <svg viewBox="0 0 500 420" className="topology-svg">
-        {/* Draw edges between all node pairs */}
-        {positions.map((a, i) =>
-          positions.slice(i + 1).map((b, j) => {
-            const targetIdx = i + j + 1
-            const aNode = overview?.nodes[i]
-            const bNode = overview?.nodes[targetIdx]
-            const active = aNode && bNode
-            return (
-              <line
-                key={`${i}-${targetIdx}`}
-                x1={a.x} y1={a.y}
-                x2={b.x} y2={b.y}
-                stroke={active ? '#4facfe33' : '#ffffff11'}
-                strokeWidth={active ? 2 : 1}
-                strokeDasharray={active ? undefined : '4 4'}
-              />
-            )
-          })
-        )}
+        {/* Draw edges between nodes */}
+        {displayNodes.length > 1 &&
+          positions.map((a, i) =>
+            positions.slice(i + 1).map((b, j) => {
+              const targetIdx = i + j + 1
+              const aNode = displayNodes[i]
+              const bNode = displayNodes[targetIdx]
+              const active = connected && aNode && bNode
+              return (
+                <line
+                  key={`${i}-${targetIdx}`}
+                  x1={a.x} y1={a.y}
+                  x2={b.x} y2={b.y}
+                  stroke={active ? '#4facfe55' : '#ffffff11'}
+                  strokeWidth={active ? 2 : 1}
+                  strokeDasharray={active ? undefined : '4 4'}
+                />
+              )
+            })
+          )}
 
         {/* Node circles */}
         {positions.map((pos, i) => {
-          const node = overview?.nodes[i]
-          const offline = !node || node.node_id.includes('offline')
-          const badge = roleBadge(node?.role, offline)
-          const isLeader = node?.role === 'leader'
+          const node = displayNodes[i]
+          const isOffline = !connected || !node
+          const badge = roleBadge(node?.role, isOffline)
+          const isLeader = connected && node?.role === 'leader'
 
           return (
             <g key={i} transform={`translate(${pos.x},${pos.y})`}>
@@ -86,8 +115,8 @@ export function TopologyView({ overview, connected }: TopologyViewProps) {
               {/* Glow */}
               <circle
                 r={40}
-                fill={`${roleColor(node?.role)}22`}
-                stroke={roleColor(node?.role)}
+                fill={isOffline ? '#ef444415' : `${roleColor(node?.role)}22`}
+                stroke={isOffline ? '#ef444488' : roleColor(node?.role)}
                 strokeWidth={isLeader ? 3 : 1.5}
               />
               {/* Node ID */}
@@ -103,7 +132,7 @@ export function TopologyView({ overview, connected }: TopologyViewProps) {
                 {node?.node_id ?? `node${i + 1}`}
               </text>
               {/* Commit index */}
-              {node && (
+              {node && connected && (
                 <text
                   textAnchor="middle"
                   dominantBaseline="middle"
@@ -134,9 +163,10 @@ export function TopologyView({ overview, connected }: TopologyViewProps) {
 
       {!connected && (
         <div className="topology-offline-notice">
-          ⚠ SSE disconnected — attempting to reconnect to gateway…
+          ⚡ Connecting to Raft backend (Render free tier may take ~30s on cold start)...
         </div>
       )}
     </div>
   )
 }
+
