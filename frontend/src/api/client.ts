@@ -1,5 +1,5 @@
-// Gateway API base URL — in dev, set VITE_GATEWAY_URL; in prod, same origin
-const BASE = import.meta.env.VITE_GATEWAY_URL ?? ''
+// Gateway API base URL — checks VITE_GATEWAY_URL, VITE_API_URL, or defaults to Render live node
+const BASE = (import.meta.env.VITE_GATEWAY_URL || import.meta.env.VITE_API_URL || 'https://raft-kv-node1.onrender.com').replace(/\/$/, '')
 
 export interface NodeStatus {
   node_id: string
@@ -34,9 +34,23 @@ function authHeaders(token?: string): Record<string, string> {
 }
 
 export async function getOverview(): Promise<ClusterOverview> {
-  const res = await fetch(`${BASE}/cluster/overview`)
-  if (!res.ok) throw new Error(`overview: ${res.status}`)
-  return res.json()
+  try {
+    const res = await fetch(`${BASE}/cluster/overview`)
+    if (res.ok) {
+      return await res.json()
+    }
+  } catch {}
+
+  // Fallback to direct node /status endpoint if gateway /cluster/overview is not present
+  const res = await fetch(`${BASE}/status`)
+  if (!res.ok) throw new Error(`status: ${res.status}`)
+  const status: NodeStatus = await res.json()
+  return {
+    nodes: [status],
+    leader_id: status.role === 'leader' ? status.node_id : (status.voted_for || status.node_id),
+    leader_url: BASE,
+    updated_at: new Date().toISOString()
+  }
 }
 
 export async function kvGet(key: string, token?: string): Promise<{ key: string; value: string }> {
@@ -81,9 +95,14 @@ export async function kvDelete(key: string, token?: string): Promise<{ status: s
 }
 
 export async function getAggregateMetrics(): Promise<string> {
-  const res = await fetch(`${BASE}/metrics/aggregate`)
+  try {
+    const res = await fetch(`${BASE}/metrics/aggregate`)
+    if (res.ok) return await res.text()
+  } catch {}
+
+  const res = await fetch(`${BASE}/metrics`)
   if (!res.ok) throw new Error(`metrics: ${res.status}`)
-  return res.text()
+  return await res.text()
 }
 
 export async function adminAddNode(
