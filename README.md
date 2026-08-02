@@ -11,6 +11,12 @@ A production-grade, from-scratch implementation of the Raft Consensus Algorithm 
 - **Unified API Gateway & React Web Dashboard** (Real-time cluster topology, metrics, SSE event streaming, and KV console)
 - **mTLS Security**, **WAL & Snapshot Durability**, and zero-dependency **Prometheus & Grafana observability**.
 
+> [!TIP]
+> **Live Deployed Instance**: [`https://raft-kv-node1.onrender.com`](https://raft-kv-node1.onrender.com)
+> - **Live Cluster Status**: [`https://raft-kv-node1.onrender.com/status`](https://raft-kv-node1.onrender.com/status)
+> - **Live Prometheus Metrics**: [`https://raft-kv-node1.onrender.com/metrics`](https://raft-kv-node1.onrender.com/metrics)
+> - **Live Health Check**: [`https://raft-kv-node1.onrender.com/healthz`](https://raft-kv-node1.onrender.com/healthz)
+
 ---
 
 ## Architecture Overview
@@ -225,7 +231,21 @@ Open `http://localhost:5173` in your browser.
 
 ## 🚀 Detailed Deployment Guide
 
-### Option 1: Deployment on Fly.io (PaaS with Persistent Storage)
+### Option 1: Deployment on Render (PaaS)
+
+Render provides automatic container builds, free SSL/TLS, and managed web service deployment for the Go backend:
+
+1. Go to **[Render Dashboard](https://dashboard.render.com)** and click **New +** -> **Web Service**.
+2. Connect your GitHub repository `Distributed_KV_Store_with_Raft_Consensus`.
+3. Choose **Docker** environment (or Dockerfile / `Dockerfile.gateway`).
+4. Set Environment Variables:
+   - `KV_API_TOKEN`: `mysecrettoken`
+   - `KV_ADMIN_TOKEN`: `adminsecrettoken`
+5. Click **Create Web Service**. Your service will be live at `https://<service-name>.onrender.com`.
+
+---
+
+### Option 2: Deployment on Fly.io (PaaS with Persistent Storage)
 
 Fly.io provides persistent volume storage (required for Raft WAL & snapshot durability) and internal private network routing between nodes.
 
@@ -239,7 +259,7 @@ Fly.io provides persistent volume storage (required for Raft WAL & snapshot dura
 
 ---
 
-### Option 2: Deployment on Single VPS (DigitalOcean / EC2 / Hetzner)
+### Option 3: Deployment on Single VPS (DigitalOcean / EC2 / Hetzner)
 
 Deploy the entire stack with a single command on any Linux VPS:
 
@@ -260,12 +280,12 @@ Deploy the entire stack with a single command on any Linux VPS:
 
 ---
 
-### Option 3: Deploying Frontend Dashboard (Vercel / Netlify)
+### Option 4: Deploying Frontend Dashboard (Vercel / Netlify)
 
 1. Connect your GitHub repository to **[Vercel](https://vercel.com)**.
 2. Set the Root Directory to `frontend`.
 3. Set the Build Command: `npm run build` and Output Directory: `dist`.
-4. Set Environment Variable: `VITE_API_URL=https://<your-gateway-domain>`.
+4. Set Environment Variable: `VITE_API_URL=https://raft-kv-node1.onrender.com`.
 
 ---
 
