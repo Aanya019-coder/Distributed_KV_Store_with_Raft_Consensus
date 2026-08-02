@@ -1,5 +1,18 @@
-// Gateway API base URL — checks VITE_GATEWAY_URL, VITE_API_URL, or defaults to Render live node
-const BASE = (import.meta.env.VITE_GATEWAY_URL || import.meta.env.VITE_API_URL || 'https://raft-kv-node1.onrender.com').replace(/\/$/, '')
+export function getBaseURL(): string {
+  const saved = localStorage.getItem('gw_api_url')
+  if (saved && saved.trim()) {
+    return saved.trim().replace(/\/$/, '')
+  }
+  return (import.meta.env.VITE_GATEWAY_URL || import.meta.env.VITE_API_URL || 'https://raft-kv-node1.onrender.com').replace(/\/$/, '')
+}
+
+export function setBaseURL(url: string): void {
+  if (!url || !url.trim()) {
+    localStorage.removeItem('gw_api_url')
+  } else {
+    localStorage.setItem('gw_api_url', url.trim().replace(/\/$/, ''))
+  }
+}
 
 export interface NodeStatus {
   node_id: string
@@ -34,27 +47,29 @@ function authHeaders(token?: string): Record<string, string> {
 }
 
 export async function getOverview(): Promise<ClusterOverview> {
+  const base = getBaseURL()
   try {
-    const res = await fetch(`${BASE}/cluster/overview`)
+    const res = await fetch(`${base}/cluster/overview`)
     if (res.ok) {
       return await res.json()
     }
   } catch {}
 
   // Fallback to direct node /status endpoint if gateway /cluster/overview is not present
-  const res = await fetch(`${BASE}/status`)
+  const res = await fetch(`${base}/status`)
   if (!res.ok) throw new Error(`status: ${res.status}`)
   const status: NodeStatus = await res.json()
   return {
     nodes: [status],
     leader_id: status.role === 'leader' ? status.node_id : (status.voted_for || status.node_id),
-    leader_url: BASE,
+    leader_url: base,
     updated_at: new Date().toISOString()
   }
 }
 
 export async function kvGet(key: string, token?: string): Promise<{ key: string; value: string }> {
-  const res = await fetch(`${BASE}/kv/${encodeURIComponent(key)}`, {
+  const base = getBaseURL()
+  const res = await fetch(`${base}/kv/${encodeURIComponent(key)}`, {
     headers: authHeaders(token),
   })
   if (!res.ok) {
@@ -65,7 +80,8 @@ export async function kvGet(key: string, token?: string): Promise<{ key: string;
 }
 
 export async function kvPut(key: string, value: string, token?: string): Promise<{ status: string }> {
-  const res = await fetch(`${BASE}/kv/${encodeURIComponent(key)}`, {
+  const base = getBaseURL()
+  const res = await fetch(`${base}/kv/${encodeURIComponent(key)}`, {
     method: 'PUT',
     body: value,
     headers: {
@@ -83,7 +99,8 @@ export async function kvPut(key: string, value: string, token?: string): Promise
 }
 
 export async function kvDelete(key: string, token?: string): Promise<{ status: string }> {
-  const res = await fetch(`${BASE}/kv/${encodeURIComponent(key)}`, {
+  const base = getBaseURL()
+  const res = await fetch(`${base}/kv/${encodeURIComponent(key)}`, {
     method: 'DELETE',
     headers: authHeaders(token),
   })
@@ -95,12 +112,13 @@ export async function kvDelete(key: string, token?: string): Promise<{ status: s
 }
 
 export async function getAggregateMetrics(): Promise<string> {
+  const base = getBaseURL()
   try {
-    const res = await fetch(`${BASE}/metrics/aggregate`)
+    const res = await fetch(`${base}/metrics/aggregate`)
     if (res.ok) return await res.text()
   } catch {}
 
-  const res = await fetch(`${BASE}/metrics`)
+  const res = await fetch(`${base}/metrics`)
   if (!res.ok) throw new Error(`metrics: ${res.status}`)
   return await res.text()
 }
@@ -111,7 +129,8 @@ export async function adminAddNode(
   httpAddr: string,
   token?: string
 ): Promise<unknown> {
-  const res = await fetch(`${BASE}/admin/addnode`, {
+  const base = getBaseURL()
+  const res = await fetch(`${base}/admin/addnode`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
     body: JSON.stringify({ id, grpc_addr: grpcAddr, http_addr: httpAddr }),
@@ -121,7 +140,8 @@ export async function adminAddNode(
 }
 
 export async function adminRemoveNode(id: string, token?: string): Promise<unknown> {
-  const res = await fetch(`${BASE}/admin/removenode`, {
+  const base = getBaseURL()
+  const res = await fetch(`${base}/admin/removenode`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
     body: JSON.stringify({ id }),

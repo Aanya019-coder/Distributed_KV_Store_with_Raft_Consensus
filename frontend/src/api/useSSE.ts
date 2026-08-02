@@ -1,7 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { getOverview, type ClusterEvent, type ClusterOverview } from './client'
-
-const BASE = (import.meta.env.VITE_GATEWAY_URL || import.meta.env.VITE_API_URL || 'https://raft-kv-node1.onrender.com').replace(/\/$/, '')
+import { getBaseURL, getOverview, type ClusterEvent, type ClusterOverview } from './client'
 
 export function useSSE(): {
   overview: ClusterOverview | null
@@ -16,6 +14,7 @@ export function useSSE(): {
 
   useEffect(() => {
     let active = true
+    const base = getBaseURL()
 
     const startPolling = () => {
       if (pollIntervalRef.current) return
@@ -43,7 +42,7 @@ export function useSSE(): {
 
     function connect() {
       try {
-        const es = new EventSource(`${BASE}/cluster/events`)
+        const es = new EventSource(`${base}/cluster/events`)
         esRef.current = es
 
         es.addEventListener('state_update', (e: MessageEvent) => {

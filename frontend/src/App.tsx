@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useSSE } from './api/useSSE'
+import { getBaseURL, setBaseURL } from './api/client'
 import { TopologyView } from './components/TopologyView'
 import { KVConsole } from './components/KVConsole'
 import { MetricsDashboard } from './components/MetricsDashboard'
@@ -14,6 +15,8 @@ export function App() {
   const [activeTab, setActiveTab] = useState<Tab>('topology')
   const [token, setToken] = useState<string>(() => sessionStorage.getItem('gw_token') || '')
   const [showAuthModal, setShowAuthModal] = useState(false)
+  const [showApiModal, setShowApiModal] = useState(false)
+  const [apiUrlInput, setApiUrlInput] = useState(getBaseURL())
 
   useEffect(() => {
     if (token) {
@@ -35,6 +38,13 @@ export function App() {
         </div>
 
         <div className="header-actions">
+          <button
+            className="auth-btn"
+            style={{ background: '#1e293b', borderColor: '#334155', color: '#94a3b8' }}
+            onClick={() => setShowApiModal(true)}
+          >
+            🔗 Target: {getBaseURL().replace(/^https?:\/\//, '')}
+          </button>
           <button
             className={`auth-btn ${token ? 'authenticated' : ''}`}
             onClick={() => setShowAuthModal(!showAuthModal)}
@@ -91,6 +101,44 @@ export function App() {
         />
       )}
 
+      {showApiModal && (
+        <div className="login-backdrop" onClick={() => setShowApiModal(false)}>
+          <div className="login-card" onClick={e => e.stopPropagation()} style={{ maxWidth: 450 }}>
+            <h3>🌐 Backend API Target</h3>
+            <p style={{ color: '#94a3b8', fontSize: '0.85rem', margin: '0.5rem 0 1rem' }}>
+              Connect your dashboard to your live Render backend or local Raft cluster:
+            </p>
+            <input
+              type="text"
+              className="login-input"
+              value={apiUrlInput}
+              onChange={e => setApiUrlInput(e.target.value)}
+              placeholder="https://raft-kv-node1.onrender.com"
+            />
+            <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end', marginTop: '1rem' }}>
+              <button
+                className="clear-token-btn"
+                onClick={() => {
+                  setBaseURL('https://raft-kv-node1.onrender.com')
+                  window.location.reload()
+                }}
+              >
+                Reset to Render
+              </button>
+              <button
+                className="save-token-btn"
+                onClick={() => {
+                  setBaseURL(apiUrlInput)
+                  window.location.reload()
+                }}
+              >
+                Save & Connect
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <main className="main-content">
         {activeTab === 'topology' && <TopologyView overview={overview} connected={connected} />}
         {activeTab === 'kv' && <KVConsole token={token} />}
@@ -107,3 +155,4 @@ export function App() {
 }
 
 export default App
+
